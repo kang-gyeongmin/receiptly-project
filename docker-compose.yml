@@ -1,0 +1,24 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: receiptly-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  backend:
+    build: .
+    container_name: receiptly-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+      - DB_NAME=receiptly
+    depends_on:
+      - mongo
+    volumes:
+      - .:/app
+
+volumes:
+  mongo_data:
