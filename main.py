@@ -1,9 +1,16 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Cookie
+from fastapi.responses import HTMLResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+import re
+import hashlib
+import secrets
+from typing import Optional
+import easyocr
+from PIL import Image, ImageEnhance, ImageOps
+from io import BytesIO
 
 load_dotenv()
 
@@ -11,90 +18,1198 @@ app = FastAPI()
 client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
 db = client[os.getenv("DB_NAME")]
 
-# ── 웹 입력 화면 ───────────────────────────────────────
+# OCR 리더 초기화
+try:
+    reader = easyocr.Reader(['ko', 'en'])
+except Exception as e:
+    print(f"⚠️ OCR 초기화 실패: {e}")
+    reader = None
+
+# 기본 카테고리
+DEFAULT_CATEGORIES = ["카페", "식사", "데이트", "고정지출"]
+
+# ── 유틸 함수 ─────────────────────────────────────
+def validate_password(password: str) -> tuple[bool, str]:
+    """비밀번호 검증 (8자 이상, 영어, 숫자, 특수문자(!,#,$))"""
+    if len(password) < 8:
+        return False, "비밀번호는 8자 이상이어야 합니다"
+
+    if not re.search(r'[a-zA-Z]', password):
+        return False, "비밀번호에 영어(a-z, A-Z)가 포함되어야 합니다"
+
+    if not re.search(r'[0-9]', password):
+        return False, "비밀번호에 숫자(0-9)가 포함되어야 합니다"
+
+    if not re.search(r'[!#$]', password):
+        return False, "비밀번호에 특수문자(!, #, $)가 포함되어야 합니다"
+
+    return True, "안전한 비밀번호입니다"
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def generate_token() -> str:
+    return secrets.token_urlsafe(32)
+
+async def get_current_user(session: Optional[str] = Cookie(None)):
+    if not session:
+        return None
+    session_doc = await db.sessions.find_one({"token": session})
+    if not session_doc:
+        return None
+    return await db.users.find_one({"_id": session_doc["user_id"]})
+
+def preprocess_image(image: Image.Image) -> Image.Image:
+    width, height = image.size
+    if width < 800 or height < 600:
+        scale = max(2, 1000 // max(width, height))
+        image = image.resize((width * scale, height * scale), Image.Resampling.LANCZOS)
+
+    try:
+        image = ImageOps.exif_transpose(image)
+    except:
+        pass
+
+    image_gray = image.convert('L')
+    enhancer = ImageEnhance.Contrast(image_gray)
+    image_gray = enhancer.enhance(1.5)
+    enhancer = ImageEnhance.Brightness(image_gray)
+    image_gray = enhancer.enhance(1.1)
+    enhancer = ImageEnhance.Sharpness(image_gray)
+    image_gray = enhancer.enhance(2.0)
+
+    return image_gray
+
+def extract_text_from_image(image_bytes: bytes) -> str:
+    if reader is None:
+        return ""
+
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        image = preprocess_image(image)
+        results = reader.readtext(image, detail=1)
+        lines = []
+        for result in results:
+            text = result[1]
+            confidence = result[2]
+            if confidence >= 0.3 and text.strip():
+                lines.append((result[0][0][1], text))
+        lines.sort(key=lambda x: x[0])
+        extracted_text = " ".join([text for _, text in lines])
+        extracted_text = re.sub(r'\s+', ' ', extracted_text).strip()
+        return extracted_text
+    except Exception as e:
+        print(f"OCR 오류: {e}")
+        return ""
+
+def parse_natural_language(text: str) -> dict:
+    text = text.strip()
+    result = {"date": None, "store_name": None, "amount": None, "memo": ""}
+
+    amount_match = re.search(r'(\d+)\s*원?$', text)
+    if amount_match:
+        result["amount"] = int(amount_match.group(1))
+        text = text[:amount_match.start()].strip()
+
+    date_match = re.search(r'(\d{1,2})[/-](\d{1,2})', text)
+    if date_match:
+        month, day = date_match.group(1), date_match.group(2)
+        today = datetime.now()
+        year = today.year
+        if int(month) > today.month:
+            year -= 1
+        result["date"] = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+        text = text[:date_match.start()] + text[date_match.end():]
+
+    store = text.strip()
+    if store:
+        result["store_name"] = store
+
+    if not result["date"]:
+        result["date"] = datetime.now().strftime("%Y-%m-%d")
+
+    return result
+
+# ── 인증 ────────────────────────────────────────
+@app.post("/auth/check-username")
+async def check_username(username: str = Form(...)):
+    """아이디 중복 확인"""
+    if not username or len(username) < 4:
+        return JSONResponse({"available": False, "message": "아이디는 4자 이상이어야 합니다"})
+
+    existing = await db.users.find_one({"username": username})
+    if existing:
+        return JSONResponse({"available": False, "message": "이미 사용 중인 아이디입니다"})
+
+    return JSONResponse({"available": True, "message": "사용 가능한 아이디입니다"})
+
+@app.post("/auth/signup")
+async def signup(username: str = Form(...), password: str = Form(...), password2: str = Form(...)):
+    # 아이디 검증
+    if not username or len(username) < 4:
+        return JSONResponse({"error": "아이디는 4자 이상이어야 합니다"}, status_code=400)
+
+    existing = await db.users.find_one({"username": username})
+    if existing:
+        return JSONResponse({"error": "이미 사용 중인 아이디입니다"}, status_code=400)
+
+    # 비밀번호 검증
+    if password != password2:
+        return JSONResponse({"error": "비밀번호가 일치하지 않습니다"}, status_code=400)
+
+    is_valid, message = validate_password(password)
+    if not is_valid:
+        return JSONResponse({"error": message}, status_code=400)
+
+    # 사용자 생성
+    user = {
+        "username": username,
+        "password": hash_password(password),
+        "categories": DEFAULT_CATEGORIES,
+        "created_at": datetime.now().isoformat()
+    }
+    result = await db.users.insert_one(user)
+
+    # 자동 로그인
+    token = generate_token()
+    await db.sessions.insert_one({"user_id": result.inserted_id, "token": token})
+
+    response = JSONResponse({"status": "success", "message": "회원가입 완료되었습니다"})
+    response.set_cookie("session", token, httponly=True, max_age=86400*30)
+    return response
+
+@app.post("/auth/login")
+async def login(username: str = Form(...), password: str = Form(...)):
+    user = await db.users.find_one({"username": username, "password": hash_password(password)})
+    if not user:
+        return JSONResponse({"error": "계정 정보가 일치하지 않습니다"}, status_code=400)
+
+    token = generate_token()
+    await db.sessions.insert_one({"user_id": user["_id"], "token": token})
+
+    response = JSONResponse({"status": "success"})
+    response.set_cookie("session", token, httponly=True, max_age=86400*30)
+    return response
+
+@app.post("/auth/logout")
+async def logout(session: Optional[str] = Cookie(None)):
+    if session:
+        await db.sessions.delete_one({"token": session})
+
+    response = JSONResponse({"status": "success"})
+    response.delete_cookie("session")
+    return response
+
+# ── 메인 페이지 ────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
-async def home():
-    return """
-    <html>
-    <head>
-        <title>Receiptly</title>
-        <style>
-            body { font-family: sans-serif; max-width: 500px; margin: 60px auto; }
-            input, textarea { width: 100%; padding: 8px; margin: 6px 0 16px; box-sizing: border-box; }
-            button { background: #4A90D9; color: white; padding: 10px 24px; border: none; cursor: pointer; border-radius: 6px; }
-            h2 { color: #1A1A2E; }
-        </style>
-    </head>
-    <body>
-        <h2>🧾 Receiptly</h2>
+async def home(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
 
-        <h3>텍스트 입력</h3>
-        <form action="/add/text" method="post">
-            <input name="store_name" placeholder="가게명" required />
-            <input name="amount"     placeholder="금액 (숫자)" type="number" required />
-            <input name="date"       placeholder="날짜 (YYYY-MM-DD)" required />
-            <textarea name="memo"    placeholder="메모 (선택)"></textarea>
-            <button type="submit">저장</button>
-        </form>
+    if not user:
+        return LOGIN_PAGE
 
-        <hr style="margin: 40px 0" />
+    return DASHBOARD_PAGE
 
-        <h3>이미지 업로드</h3>
-        <form action="/add/image" method="post" enctype="multipart/form-data">
-            <input type="file" name="file" accept="image/*" required />
-            <button type="submit">업로드</button>
-        </form>
-    </body>
-    </html>
-    """
+# ── 데이터 저장 ────────────────────────────────────
+@app.post("/add/expense")
+async def add_expense(date: str = Form(...), store: str = Form(...), amount: int = Form(...), category: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
 
-# ── 텍스트 저장 ────────────────────────────────────────
-@app.post("/add/text")
-async def add_text(
-    store_name: str = Form(...),
-    amount:     int = Form(...),
-    date:       str = Form(...),
-    memo:       str = Form("")
-):
     doc = {
-        "type":       "text",
-        "store_name": store_name,
-        "amount":     amount,
-        "date":       date,
-        "memo":       memo,
-        "created_at": datetime.utcnow().isoformat()
+        "user_id": user["_id"],
+        "date": date,
+        "store_name": store,
+        "amount": amount,
+        "category": category,
+        "created_at": datetime.now().isoformat()
     }
     await db.expenses.insert_one(doc)
-    return HTMLResponse("<script>alert('저장 완료!'); location.href='/'</script>")
+    return {"status": "success"}
 
-# ── 이미지 저장 ────────────────────────────────────────
-@app.post("/add/image")
-async def add_image(file: UploadFile = File(...)):
-    contents = await file.read()
-    doc = {
-        "type":      "image",
-        "filename":  file.filename,
-        "size":      len(contents),
-        "data":      contents,          # 3단계에서 OCR로 교체 예정
-        "created_at": datetime.utcnow().isoformat()
+@app.get("/api/expenses")
+async def get_expenses(month: Optional[str] = None, session: Optional[str] = Cookie(None)):
+    """사용자 지출 목록 조회 (월별)"""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    if not month:
+        month = datetime.now().strftime("%Y-%m")
+
+    expenses = []
+    async for doc in db.expenses.find({
+        "user_id": user["_id"],
+        "date": {"$regex": f"^{month}"}
+    }).sort("date", 1):
+        doc["_id"] = str(doc["_id"])
+        expenses.append(doc)
+
+    return {"expenses": expenses}
+
+@app.get("/api/expenses/by-date")
+async def get_expenses_by_date(date: str, session: Optional[str] = Cookie(None)):
+    """특정 날짜의 지출 목록 조회"""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    expenses = []
+    async for doc in db.expenses.find({
+        "user_id": user["_id"],
+        "date": date
+    }).sort("created_at", -1):
+        doc["_id"] = str(doc["_id"])
+        expenses.append(doc)
+
+    return {"expenses": expenses}
+
+# ── 챗봇 ──────────────────────────────────────────
+@app.post("/chat")
+async def chat(message: str, session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    if "얼마" in message or "지출" in message:
+        month = datetime.now().strftime("%Y-%m")
+        expenses = await db.expenses.find({
+            "user_id": user["_id"],
+            "date": {"$regex": f"^{month}"}
+        }).to_list(None)
+
+        total = sum(e.get("amount", 0) for e in expenses)
+        return {"response": f"이번달 총 지출: {total:,}원 ({len(expenses)}건)"}
+
+    return {"response": "입력해주신 내용을 이해했습니다."}
+
+# HTML 페이지들
+LOGIN_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Receiptly - 로그인</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            width: 90%;
+            max-width: 400px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        h1 { font-size: 32px; margin-bottom: 30px; text-align: center; color: #333; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; color: #666; font-weight: 500; }
+        input { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
+        button { width: 100%; padding: 12px; background: #4A90D9; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500; margin-top: 10px; }
+        button:hover { background: #357ABD; }
+        .toggle { text-align: center; margin-top: 15px; font-size: 14px; color: #666; }
+        .toggle a { color: #4A90D9; cursor: pointer; }
+        .form-section { display: none; }
+        .form-section.active { display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🧾 Receiptly</h1>
+
+        <div id="login" class="form-section active">
+            <form onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label>아이디</label>
+                    <input type="text" name="username" required />
+                </div>
+                <div class="form-group">
+                    <label>비밀번호</label>
+                    <input type="password" name="password" required />
+                </div>
+                <button type="submit">로그인</button>
+            </form>
+            <div class="toggle">
+                계정이 없으신가요? <a onclick="toggleForm()">회원가입</a>
+            </div>
+        </div>
+
+        <div id="signup" class="form-section">
+            <form onsubmit="handleSignup(event)">
+                <div class="form-group">
+                    <label>아이디</label>
+                    <input type="text" id="signup-username" name="username" placeholder="4자 이상" required onblur="checkUsername()" />
+                    <small id="username-feedback" style="font-size: 12px; color: #999;"></small>
+                </div>
+                <div class="form-group">
+                    <label>비밀번호</label>
+                    <input type="password" id="signup-password" name="password" placeholder="8자+영어+숫자+특수문자(!,#,$)" required onkeyup="checkPassword()" />
+                    <small id="password-feedback" style="font-size: 12px; color: #999;"></small>
+                    <div id="password-checks" style="font-size: 11px; margin-top: 8px;">
+                        <div id="check-length" style="color: #999;">✗ 8자 이상</div>
+                        <div id="check-letter" style="color: #999;">✗ 영어 포함</div>
+                        <div id="check-number" style="color: #999;">✗ 숫자 포함</div>
+                        <div id="check-special" style="color: #999;">✗ 특수문자(!,#,$) 포함</div>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>비밀번호 확인</label>
+                    <input type="password" id="signup-password2" name="password2" required onkeyup="checkPasswordMatch()" />
+                    <small id="password-match-feedback" style="font-size: 12px; color: #999;"></small>
+                </div>
+                <button type="submit" id="signup-btn" disabled>가입하기</button>
+            </form>
+            <div class="toggle">
+                이미 계정이 있으신가요? <a onclick="toggleForm()">로그인</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function toggleForm() {
+        document.getElementById('login').classList.toggle('active');
+        document.getElementById('signup').classList.toggle('active');
     }
-    await db.images.insert_one(doc)
-    return HTMLResponse("<script>alert('업로드 완료!'); location.href='/'</script>")
 
-# ── 저장된 데이터 확인 ─────────────────────────────────
-@app.get("/list")
-async def list_expenses():
-    result = []
-    async for doc in db.expenses.find().sort("created_at", -1).limit(20):
-        doc["_id"] = str(doc["_id"])
-        result.append(doc)
-    return result
+    // 아이디 중복 확인
+    async function checkUsername() {
+        const username = document.getElementById('signup-username').value;
+        const feedback = document.getElementById('username-feedback');
 
-@app.get("/list/images")
-async def list_images():
-    result = []
-    async for doc in db.images.find().sort("created_at", -1).limit(20):
-        doc["_id"] = str(doc["_id"])
-        doc.pop("data", None)  # 바이너리 데이터는 제외하고 메타만 반환
-        result.append(doc)
-    return result
+        if (!username) {
+            feedback.textContent = '';
+            return;
+        }
+
+        const form = new FormData();
+        form.append('username', username);
+
+        const response = await fetch('/auth/check-username', {method: 'POST', body: form});
+        const result = await response.json();
+
+        if (result.available) {
+            feedback.textContent = '✓ ' + result.message;
+            feedback.style.color = '#4CAF50';
+        } else {
+            feedback.textContent = '✗ ' + result.message;
+            feedback.style.color = '#f44336';
+        }
+
+        updateSignupButton();
+    }
+
+    // 비밀번호 검증
+    function checkPassword() {
+        const password = document.getElementById('signup-password').value;
+
+        const checks = {
+            'check-length': password.length >= 8,
+            'check-letter': /[a-zA-Z]/.test(password),
+            'check-number': /[0-9]/.test(password),
+            'check-special': /[!#$]/.test(password)
+        };
+
+        for (const [id, passed] of Object.entries(checks)) {
+            const elem = document.getElementById(id);
+            if (passed) {
+                elem.style.color = '#4CAF50';
+                elem.textContent = elem.textContent.replace('✗', '✓');
+            } else {
+                elem.style.color = '#999';
+                elem.textContent = elem.textContent.replace('✓', '✗');
+            }
+        }
+
+        checkPasswordMatch();
+        updateSignupButton();
+    }
+
+    // 비밀번호 일치 확인
+    function checkPasswordMatch() {
+        const pwd = document.getElementById('signup-password').value;
+        const pwd2 = document.getElementById('signup-password2').value;
+        const feedback = document.getElementById('password-match-feedback');
+
+        if (!pwd2) {
+            feedback.textContent = '';
+            return;
+        }
+
+        if (pwd === pwd2) {
+            feedback.textContent = '✓ 비밀번호가 일치합니다';
+            feedback.style.color = '#4CAF50';
+        } else {
+            feedback.textContent = '✗ 비밀번호가 일치하지 않습니다';
+            feedback.style.color = '#f44336';
+        }
+
+        updateSignupButton();
+    }
+
+    // 가입 버튼 활성화 여부
+    async function updateSignupButton() {
+        const username = document.getElementById('signup-username').value;
+        const password = document.getElementById('signup-password').value;
+        const password2 = document.getElementById('signup-password2').value;
+        const usernameFeedback = document.getElementById('username-feedback').style.color === 'rgb(76, 175, 80)';
+        const passwordValid = password.length >= 8 && /[a-zA-Z]/.test(password) && /[0-9]/.test(password) && /[!#$]/.test(password);
+        const passwordMatch = password === password2 && password2;
+
+        const btn = document.getElementById('signup-btn');
+        btn.disabled = !(usernameFeedback && passwordValid && passwordMatch);
+    }
+
+    async function handleLogin(e) {
+        e.preventDefault();
+        const data = new FormData(e.target);
+        const response = await fetch('/auth/login', {method: 'POST', body: data});
+        const result = await response.json();
+        if (result.status === 'success') {
+            location.href = '/';
+        } else {
+            alert(result.error);
+        }
+    }
+
+    async function handleSignup(e) {
+        e.preventDefault();
+        const data = new FormData(e.target);
+        const response = await fetch('/auth/signup', {method: 'POST', body: data});
+        const result = await response.json();
+        if (result.status === 'success') {
+            location.href = '/';
+        } else {
+            alert(result.error);
+        }
+    }
+    </script>
+</body>
+</html>"""
+
+DASHBOARD_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Receiptly - 가계부</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; }
+        .container { display: grid; grid-template-columns: 1.5fr 320px; gap: 20px; padding: 20px; max-width: 1600px; margin: 0 auto; }
+        .main { background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .sidebar { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); height: fit-content; }
+
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 2px solid #eee; padding-bottom: 20px; }
+        .header h1 { font-size: 32px; }
+        .header button { padding: 8px 16px; width: auto; }
+
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 2px solid #eee; }
+        .tab { padding: 12px 20px; cursor: pointer; border: none; background: none; font-size: 16px; color: #666; border-bottom: 3px solid transparent; }
+        .tab.active { color: #4A90D9; border-bottom-color: #4A90D9; }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        .calendar-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .calendar-header h3 { flex: 1; text-align: center; }
+        .calendar-header button { padding: 8px 12px; width: auto; }
+
+        .calendar { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; margin-bottom: 30px; }
+        .calendar-label { text-align: center; font-weight: 600; padding: 10px 0; font-size: 12px; color: #999; }
+        .calendar-day { padding: 12px 8px; background: #f9f9f9; border-radius: 6px; text-align: center; cursor: pointer; border: 1px solid #ddd; min-height: 80px; display: flex; flex-direction: column; justify-content: space-between; font-size: 13px; }
+        .calendar-day:hover { background: #e8f4f8; border-color: #4A90D9; }
+        .calendar-day.today { background: #fff3cd; border-color: #ffc107; }
+        .calendar-day.selected { background: #4A90D9; color: white; border-color: #4A90D9; }
+        .calendar-day .date { font-weight: 600; }
+        .calendar-day .amount { font-size: 11px; color: #666; margin-top: 4px; }
+        .calendar-day.selected .amount { color: #e8f4f8; }
+
+        .stats { background: #f9f9f9; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .stats h4 { margin-bottom: 15px; }
+        .stat-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; }
+        .stat-item:last-child { border-bottom: none; }
+        .stat-item .category { font-weight: 500; }
+        .stat-item .amount { color: #4A90D9; font-weight: 600; }
+
+        .period-buttons { display: flex; gap: 10px; margin-bottom: 20px; }
+        .period-buttons button { flex: 1; padding: 8px; background: #f0f0f0; border: none; border-radius: 6px; cursor: pointer; }
+        .period-buttons button.active { background: #4A90D9; color: white; }
+
+        table { width: 100%; border-collapse: collapse; }
+        table th { background: #f9f9f9; padding: 12px; text-align: left; border-bottom: 2px solid #eee; font-weight: 600; }
+        table td { padding: 12px; border-bottom: 1px solid #eee; }
+        table tr:hover { background: #f5f5f5; }
+
+        input, select, button { width: 100%; padding: 10px; margin: 8px 0; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
+        button { background: #4A90D9; color: white; border: none; cursor: pointer; font-weight: 500; }
+        button:hover { background: #357ABD; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+
+        .chatbot { border: 1px solid #ddd; border-radius: 8px; display: flex; flex-direction: column; height: 500px; }
+        .chat-messages { flex: 1; overflow-y: auto; padding: 15px; font-size: 13px; }
+        .chat-message { margin: 8px 0; padding: 10px; border-radius: 6px; word-wrap: break-word; }
+        .chat-message.bot { background: #E8F4F8; }
+        .chat-message.user { background: #4A90D933; text-align: right; }
+        .chat-input { padding: 10px; border-top: 1px solid #ddd; display: flex; gap: 5px; }
+        .chat-input input { margin: 0; flex: 1; }
+        .chat-input button { margin: 0; width: 40px; padding: 8px; }
+
+        .sidebar h3 { margin-bottom: 15px; font-size: 16px; }
+        .sidebar hr { margin: 20px 0; }
+
+        .selected-date-info { background: #f9f9f9; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+        .selected-date-info h4 { margin-bottom: 10px; color: #333; }
+        .selected-date-info .date-label { font-size: 12px; color: #999; }
+
+        @media (max-width: 1000px) {
+            .container { grid-template-columns: 1fr; }
+            .calendar-day { min-height: 60px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="main">
+            <div class="header">
+                <h1>🧾 Receiptly</h1>
+                <button onclick="logout()">로그아웃</button>
+            </div>
+
+            <div class="tabs">
+                <button class="tab active" onclick="switchTab('calendar')">📅 달력</button>
+                <button class="tab" onclick="switchTab('analysis')">📊 분석</button>
+            </div>
+
+            <!-- 달력 탭 -->
+            <div id="calendar" class="tab-content active">
+                <div class="calendar-header">
+                    <button onclick="prevMonth()">←</button>
+                    <h3 id="monthTitle">2024년 6월</h3>
+                    <button onclick="nextMonth()">→</button>
+                </div>
+
+                <div style="display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; margin-bottom: 20px;">
+                    <div class="calendar-label">일</div>
+                    <div class="calendar-label">월</div>
+                    <div class="calendar-label">화</div>
+                    <div class="calendar-label">수</div>
+                    <div class="calendar-label">목</div>
+                    <div class="calendar-label">금</div>
+                    <div class="calendar-label">토</div>
+                </div>
+                <div id="calendar-grid" class="calendar"></div>
+
+                <div id="selected-date-section" style="display: none;">
+                    <div class="stats" id="selected-date-stats">
+                        <h4>📅 지출 내역</h4>
+                        <div class="stat-item">
+                            <span>지출이 없습니다</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 분석 탭 -->
+            <div id="analysis" class="tab-content">
+                <div class="period-buttons">
+                    <button class="active" onclick="setPeriod('month')">이번 달</button>
+                    <button onclick="setPeriod('week')">이번 주</button>
+                    <button onclick="setPeriod('year')">이번 해</button>
+                </div>
+
+                <div class="stats" id="analysis-stats">
+                    <h4>카테고리별 지출</h4>
+                    <div class="stat-item">
+                        <span>데이터 로딩 중...</span>
+                    </div>
+                </div>
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th>날짜</th>
+                            <th>가게</th>
+                            <th style="text-align: right;">금액</th>
+                            <th>카테고리</th>
+                        </tr>
+                    </thead>
+                    <tbody id="expense-table">
+                        <tr><td colspan="4" style="text-align: center; color: #999;">지출 내역이 없습니다</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 사이드바 -->
+        <div class="sidebar">
+            <h3>✏️ 지출 입력</h3>
+            <input type="text" id="store" placeholder="가게명" />
+            <input type="number" id="amount" placeholder="금액" />
+            <input type="date" id="date" />
+            <div style="display: flex; gap: 5px;">
+                <select id="category" style="flex: 1;">
+                    <option>카페</option>
+                    <option>식사</option>
+                    <option>데이트</option>
+                    <option>고정지출</option>
+                </select>
+                <button onclick="openCategoryModal()" style="width: 40px; padding: 10px; margin: 8px 0;">⚙️</button>
+            </div>
+            <button onclick="addExpense()">저장</button>
+
+            <hr />
+
+            <h3>💬 챗봇</h3>
+            <div class="chatbot">
+                <div class="chat-messages" id="messages">
+                    <div class="chat-message bot">안녕하세요! 지출에 대해 물어보세요.</div>
+                </div>
+                <div class="chat-input">
+                    <input type="text" id="chat-input" placeholder="메시지..." onkeypress="if(event.key=='Enter') sendChat()" />
+                    <button onclick="sendChat()">→</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 카테고리 관리 모달 -->
+    <div id="categoryModal" style="display: none !important; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 12px; padding: 30px; width: 90%; max-width: 400px; box-shadow: 0 10px 40px rgba(0,0,0,0.2);">
+            <h2>📂 카테고리 관리</h2>
+
+            <div style="margin: 20px 0;">
+                <h4 style="margin-bottom: 10px;">현재 카테고리</h4>
+                <div id="categoryList" style="max-height: 250px; overflow-y: auto;"></div>
+            </div>
+
+            <h4 style="margin-top: 20px; margin-bottom: 10px;">새 카테고리 추가</h4>
+            <div style="display: flex; gap: 5px;">
+                <input type="text" id="newCategoryName" placeholder="카테고리명" style="flex: 1;" />
+                <button onclick="addNewCategory()" style="width: 60px;">추가</button>
+            </div>
+
+            <button onclick="closeCategoryModal()" style="margin-top: 20px; background: #999;">닫기</button>
+        </div>
+    </div>
+
+    <script>
+    let currentMonth = new Date();
+    let selectedDate = null;
+    let monthExpenses = [];
+
+    // 월별 지출 데이터 로드
+    async function loadExpensesAndRender() {
+        try {
+            const year = currentMonth.getFullYear();
+            const month = String(currentMonth.getMonth() + 1).padStart(2, '0');
+            const monthStr = year + '-' + month;
+
+            console.log('📅 지출 데이터 로드: ' + monthStr);
+
+            const response = await fetch('/api/expenses?month=' + monthStr);
+            if (!response.ok) {
+                throw new Error('API 응답 실패: ' + response.status);
+            }
+            const data = await response.json();
+            monthExpenses = data.expenses || [];
+
+            console.log('✅ 로드된 지출 기록: ' + monthExpenses.length + '개');
+
+            // 달력 렌더링
+            if (document.getElementById('calendar-grid')) {
+                renderCalendar();
+                console.log('✅ 달력 렌더링 완료');
+            } else {
+                console.warn('⚠️ calendar-grid 요소를 찾을 수 없음');
+            }
+        } catch (e) {
+            console.error('지출 데이터 로드 오류:', e);
+            monthExpenses = [];
+            renderCalendar();
+        }
+    }
+
+    function switchTab(tab) {
+        document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+        document.getElementById(tab).classList.add('active');
+        event.target.classList.add('active');
+        if (tab === 'calendar') renderCalendar();
+        else loadAnalysis();
+    }
+
+    function prevMonth() {
+        currentMonth.setMonth(currentMonth.getMonth() - 1);
+        loadExpensesAndRender();
+    }
+
+    function nextMonth() {
+        currentMonth.setMonth(currentMonth.getMonth() + 1);
+        loadExpensesAndRender();
+    }
+
+    function renderCalendar() {
+        const year = currentMonth.getFullYear();
+        const month = currentMonth.getMonth();
+        const monthNames = ['1월', '2월', '3월', '4월', '5월', '6월', '7월', '8월', '9월', '10월', '11월', '12월'];
+
+        console.log('🎨 달력 렌더링 시작: ' + year + '년 ' + monthNames[month] + ' (지출: ' + monthExpenses.length + '개)');
+
+        document.getElementById('monthTitle').textContent = year + '년 ' + monthNames[month];
+
+        const grid = document.getElementById('calendar-grid');
+        grid.innerHTML = '';
+
+        const firstDay = new Date(year, month, 1).getDay();
+        const daysInMonth = new Date(year, month + 1, 0).getDate();
+        const today = new Date();
+
+        for (let i = 0; i < firstDay; i++) {
+            const empty = document.createElement('div');
+            grid.appendChild(empty);
+        }
+
+        let daysWithExpenses = 0;
+
+        for (let day = 1; day <= daysInMonth; day++) {
+            const dateStr = year + '-' + String(month + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+            const dayDiv = document.createElement('div');
+            dayDiv.className = 'calendar-day';
+
+            const isToday = dateStr === today.toISOString().split('T')[0];
+            if (isToday) dayDiv.classList.add('today');
+
+            // 해당 날짜의 지출 정보 추출
+            const dayExpenses = monthExpenses.filter(e => e.date === dateStr);
+            if (dayExpenses.length > 0) {
+                daysWithExpenses++;
+            }
+
+            const categoryTotals = {};
+            dayExpenses.forEach(e => {
+                if (!categoryTotals[e.category]) {
+                    categoryTotals[e.category] = 0;
+                }
+                categoryTotals[e.category] += e.amount;
+            });
+
+            // HTML 구성
+            let html = '<div class="date">' + day + '</div>';
+            if (dayExpenses.length > 0) {
+                html += '<div style="font-size: 11px; margin-top: 4px;">';
+                for (const [cat, total] of Object.entries(categoryTotals)) {
+                    html += '<div style="color: #666; margin-bottom: 2px;">' + cat + ' ' + total.toLocaleString() + '원</div>';
+                }
+                html += '</div>';
+            }
+
+            dayDiv.innerHTML = html;
+            dayDiv.onclick = () => selectDate(dateStr);
+            grid.appendChild(dayDiv);
+        }
+
+        console.log('✅ 달력 렌더링 완료 - ' + daysWithExpenses + '개 날짜에 지출 표시');
+    }
+
+    function selectDate(dateStr) {
+        selectedDate = dateStr;
+        document.getElementById('selected-date').textContent = dateStr;
+
+        // 달력 선택 상태 업데이트
+        document.querySelectorAll('.calendar-day').forEach(d => d.classList.remove('selected'));
+        event.target.closest('.calendar-day').classList.add('selected');
+
+        // 해당 날짜의 지출 내역만 표시
+        showDateExpenses(dateStr);
+    }
+
+    async function showDateExpenses(dateStr) {
+        try {
+            console.log('📋 조회: ' + dateStr);
+
+            const response = await fetch('/api/expenses/by-date?date=' + dateStr);
+            if (!response.ok) {
+                throw new Error('API 응답 실패: ' + response.status);
+            }
+
+            const data = await response.json();
+            const expenses = data.expenses || [];
+
+            console.log('✅ ' + dateStr + ' 지출: ' + expenses.length + '개');
+
+            const statsDiv = document.getElementById('selected-date-stats');
+            if (expenses.length === 0) {
+                statsDiv.innerHTML = '<h4>📅 ' + dateStr + ' 지출 내역</h4><div class="stat-item"><span>이 날짜에 지출이 없습니다</span></div>';
+            } else {
+                const total = expenses.reduce((sum, e) => sum + e.amount, 0);
+                const html = '<h4>📅 ' + dateStr + ' 지출 내역 (' + expenses.length + '건)</h4>' +
+                    expenses.map(e => `<div class="stat-item"><span class="category">${e.store_name} <span style="font-size: 12px; color: #999;">(${e.category})</span></span><span class="amount">${e.amount.toLocaleString()}원</span></div>`).join('') +
+                    `<div class="stat-item" style="border-top: 2px solid #ddd; padding-top: 10px; margin-top: 10px; font-weight: 600;"><span>합계</span><span style="color: #4A90D9;">${total.toLocaleString()}원</span></div>`;
+                statsDiv.innerHTML = html;
+            }
+            document.getElementById('selected-date-section').style.display = 'block';
+        } catch (e) {
+            console.error('지출 조회 오류:', e);
+            alert('지출 내역을 불러올 수 없습니다');
+        }
+    }
+
+    function setPeriod(period) {
+        document.querySelectorAll('.period-buttons button').forEach(b => b.classList.remove('active'));
+        event.target.classList.add('active');
+        loadAnalysis();
+    }
+
+    async function loadAnalysis() {
+        // 샘플 데이터 로드 (실제로는 서버에서 가져옴)
+        const stats = '<div class="stat-item"><span class="category">식사</span><span class="amount">45,000원</span></div><div class="stat-item"><span class="category">카페</span><span class="amount">15,000원</span></div><div class="stat-item"><span class="category">데이트</span><span class="amount">60,000원</span></div>';
+        document.getElementById('analysis-stats').innerHTML = '<h4>카테고리별 지출</h4>' + stats;
+
+        const table = '<tr><td>2024-06-20</td><td>서브웨이</td><td style="text-align: right;">12,000원</td><td>식사</td></tr><tr><td>2024-06-19</td><td>스타벅스</td><td style="text-align: right;">5,500원</td><td>카페</td></tr>';
+        document.getElementById('expense-table').innerHTML = table;
+    }
+
+    async function addExpense() {
+        const store = document.getElementById('store').value;
+        const amount = document.getElementById('amount').value;
+        const date = document.getElementById('date').value;
+        const category = document.getElementById('category').value;
+
+        if (!store || !amount || !date) {
+            alert('모든 항목을 입력해주세요');
+            return;
+        }
+
+        const form = new FormData();
+        form.append('date', date);
+        form.append('store', store);
+        form.append('amount', parseInt(amount));
+        form.append('category', category);
+
+        try {
+            const response = await fetch('/add/expense', {method: 'POST', body: form});
+            const result = await response.json();
+            if (result.status === 'success') {
+                document.getElementById('store').value = '';
+                document.getElementById('amount').value = '';
+
+                // 입력한 날짜의 달로 이동
+                const inputDate = new Date(date);
+                currentMonth = new Date(inputDate.getFullYear(), inputDate.getMonth(), 1);
+
+                await loadExpensesAndRender();
+
+                // 달력 탭으로 자동 전환
+                document.getElementById('calendar').classList.add('active');
+                document.getElementById('analysis').classList.remove('active');
+                document.querySelectorAll('.tab').forEach((btn, idx) => {
+                    if (idx === 0) btn.classList.add('active');
+                    else btn.classList.remove('active');
+                });
+
+                alert('저장 완료!');
+            } else {
+                alert(result.error || '저장 실패');
+            }
+        } catch (e) {
+            console.error('지출 저장 오류:', e);
+            alert('오류가 발생했습니다');
+        }
+    }
+
+    async function addQuickExpense() {
+        if (!selectedDate) {
+            alert('날짜를 선택해주세요');
+            return;
+        }
+
+        const store = document.getElementById('quick-store').value;
+        const amount = document.getElementById('quick-amount').value;
+        const category = document.getElementById('quick-category').value;
+
+        if (!store || !amount) {
+            alert('가게명과 금액을 입력해주세요');
+            return;
+        }
+
+        const form = new FormData();
+        form.append('date', selectedDate);
+        form.append('store', store);
+        form.append('amount', parseInt(amount));
+        form.append('category', category);
+
+        const response = await fetch('/add/expense', {method: 'POST', body: form});
+        const result = await response.json();
+        if (result.status === 'success') {
+            document.getElementById('quick-store').value = '';
+            document.getElementById('quick-amount').value = '';
+            renderCalendar();
+        }
+    }
+
+    async function sendChat() {
+        const input = document.getElementById('chat-input').value;
+        if (!input) return;
+
+        const messages = document.getElementById('messages');
+        messages.innerHTML += '<div class="chat-message user">' + input + '</div>';
+        document.getElementById('chat-input').value = '';
+
+        const response = await fetch('/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'message=' + encodeURIComponent(input)
+        });
+        const data = await response.json();
+        messages.innerHTML += '<div class="chat-message bot">' + data.response + '</div>';
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function logout() {
+        await fetch('/auth/logout', {method: 'POST'});
+        location.href = '/';
+    }
+
+    // 카테고리 관리 함수들
+    async function loadCategories() {
+        try {
+            const response = await fetch('/api/categories');
+            const data = await response.json();
+            if (data.categories) {
+                updateSelectOptions(data.categories);
+                if (document.getElementById('categoryList')) {
+                    renderCategoryList(data.categories);
+                }
+            }
+        } catch (e) {
+            console.log('카테고리 로드 중 오류:', e);
+        }
+    }
+
+    function renderCategoryList(categories) {
+        const list = document.getElementById('categoryList');
+        list.innerHTML = categories.map((cat, idx) => `
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px; background: #f9f9f9; border-radius: 6px; margin-bottom: 8px;">
+                <span id="cat-display-${idx}" style="flex: 1;">${cat}</span>
+                <div id="cat-edit-${idx}" style="display: none; flex: 1; display: flex; gap: 5px;">
+                    <input type="text" id="cat-input-${idx}" value="${cat}" style="flex: 1; padding: 5px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px;" />
+                    <button onclick="saveEdit(${idx})" style="padding: 5px 10px; width: auto; background: #4CAF50; font-size: 12px;">✓</button>
+                    <button onclick="cancelEdit(${idx})" style="padding: 5px 10px; width: auto; background: #999; font-size: 12px;">✕</button>
+                </div>
+                <button onclick="startEdit(${idx}, '${cat}')" style="padding: 5px 10px; width: auto; background: #FF9800; font-size: 12px; margin-left: 5px;">수정</button>
+                <button onclick="deleteCategory('${cat}')" style="padding: 5px 10px; width: auto; background: #f44336; font-size: 12px; margin-left: 5px;">삭제</button>
+            </div>
+        `).map((html, idx) => html.replace('display: none; flex: 1; display: flex;', 'display: none; flex: 1;')).join('');
+    }
+
+    let editingIndex = null;
+
+    function startEdit(idx, cat) {
+        if (editingIndex !== null) cancelEdit(editingIndex);
+
+        editingIndex = idx;
+        document.getElementById(`cat-display-${idx}`).style.display = 'none';
+        const editDiv = document.getElementById(`cat-edit-${idx}`);
+        editDiv.style.display = 'flex';
+        document.getElementById(`cat-input-${idx}`).focus();
+    }
+
+    function cancelEdit(idx) {
+        document.getElementById(`cat-display-${idx}`).style.display = 'block';
+        document.getElementById(`cat-edit-${idx}`).style.display = 'none';
+        editingIndex = null;
+    }
+
+    async function saveEdit(idx) {
+        const oldName = document.getElementById(`cat-display-${idx}`).textContent;
+        const newName = document.getElementById(`cat-input-${idx}`).value.trim();
+
+        if (!newName) {
+            alert('카테고리명을 입력해주세요');
+            return;
+        }
+
+        if (newName === oldName) {
+            cancelEdit(idx);
+            return;
+        }
+
+        const form = new FormData();
+        form.append('old_name', oldName);
+        form.append('new_name', newName);
+
+        const response = await fetch('/api/categories/rename', {method: 'POST', body: form});
+        const data = await response.json();
+
+        if (data.status === 'success') {
+            renderCategoryList(data.categories);
+            updateSelectOptions(data.categories);
+            editingIndex = null;
+        } else {
+            alert(data.error || '오류가 발생했습니다');
+        }
+    }
+
+    function openCategoryModal() {
+        const modal = document.getElementById('categoryModal');
+        modal.style.display = 'flex';
+        modal.style.justifyContent = 'center';
+        modal.style.alignItems = 'center';
+        loadCategories();
+        setTimeout(() => {
+            document.getElementById('newCategoryName')?.focus();
+        }, 100);
+    }
+
+    function closeCategoryModal() {
+        const modal = document.getElementById('categoryModal');
+        modal.style.display = 'none';
+    }
+
+    // 모달 외부 클릭 시 닫기
+    document.addEventListener('DOMContentLoaded', function() {
+        const modal = document.getElementById('categoryModal');
+        if (modal) {
+            modal.addEventListener('click', function(e) {
+                if (e.target === modal) {
+                    closeCategoryModal();
+                }
+            });
+        }
+    });
+
+    async function addNewCategory() {
+        const name = document.getElementById('newCategoryName').value.trim();
+        if (!name) {
+            alert('카테고리명을 입력해주세요');
+            return;
+        }
+
+        const form = new FormData();
+        form.append('name', name);
+
+        const response = await fetch('/api/categories/add', {method: 'POST', body: form});
+        const data = await response.json();
+
+        if (data.status === 'success') {
+            document.getElementById('newCategoryName').value = '';
+            renderCategoryList(data.categories);
+            updateSelectOptions(data.categories);
+        } else {
+            alert(data.error || '오류가 발생했습니다');
+        }
+    }
+
+    function updateSelectOptions(categories) {
+        const select = document.getElementById('category');
+        select.innerHTML = '';
+        categories.forEach(cat => {
+            const option = document.createElement('option');
+            option.textContent = cat;
+            select.appendChild(option);
+        });
+    }
+
+    async function deleteCategory(name) {
+        const form = new FormData();
+        form.append('name', name);
+
+        const response = await fetch('/api/categories/delete', {method: 'POST', body: form});
+        const data = await response.json();
+
+        if (data.status === 'success') {
+            renderCategoryList(data.categories);
+            updateSelectOptions(data.categories);
+        } else {
+            alert(data.error || '오류가 발생했습니다');
+        }
+    }
+
+    document.getElementById('date').valueAsDate = new Date();
+    loadExpensesAndRender();
+    loadCategories();
+    </script>
+</body>
+</html>"""
+
+# ── 카테고리 관리 API ──────────────────────────────
+@app.get("/api/categories")
+async def get_categories(session: Optional[str] = Cookie(None)):
+    """사용자 카테고리 조회"""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    categories = user.get("categories", DEFAULT_CATEGORIES)
+    return {"categories": categories}
+
+@app.post("/api/categories/add")
+async def add_category(name: str = Form(...), session: Optional[str] = Cookie(None)):
+    """카테고리 추가"""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    categories = user.get("categories", DEFAULT_CATEGORIES)
+    if name in categories:
+        return JSONResponse({"error": "이미 존재하는 카테고리입니다"}, status_code=400)
+
+    categories.append(name)
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"categories": categories}}
+    )
+    return {"status": "success", "categories": categories}
+
+@app.post("/api/categories/delete")
+async def delete_category(name: str = Form(...), session: Optional[str] = Cookie(None)):
+    """카테고리 삭제"""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    categories = user.get("categories", DEFAULT_CATEGORIES)
+    if name not in categories:
+        return JSONResponse({"error": "존재하지 않는 카테고리입니다"}, status_code=400)
+
+    if len(categories) <= 1:
+        return JSONResponse({"error": "최소 1개의 카테고리는 필요합니다"}, status_code=400)
+
+    categories.remove(name)
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"categories": categories}}
+    )
+    return {"status": "success", "categories": categories}
+
+@app.post("/api/categories/rename")
+async def rename_category(old_name: str = Form(...), new_name: str = Form(...), session: Optional[str] = Cookie(None)):
+    """카테고리 수정"""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    categories = user.get("categories", DEFAULT_CATEGORIES)
+    if old_name not in categories:
+        return JSONResponse({"error": "존재하지 않는 카테고리입니다"}, status_code=400)
+
+    if new_name in categories:
+        return JSONResponse({"error": "이미 존재하는 카테고리입니다"}, status_code=400)
+
+    idx = categories.index(old_name)
+    categories[idx] = new_name
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"categories": categories}}
+    )
+    return {"status": "success", "categories": categories}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
