@@ -1,10 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 import re
+import calendar
 import hashlib
 import secrets
 from typing import Optional
@@ -59,6 +60,10 @@ async def get_current_user(session: Optional[str] = Cookie(None)):
         return None
     return await db.users.find_one({"_id": session_doc["user_id"]})
 
+# ── ⚠️ 미사용 (Phase 2 재연결 예정) ────────────────────
+# 아래 3개 함수(preprocess_image / extract_text_from_image / parse_natural_language)는
+# 구현돼 있지만 현재 어떤 엔드포인트/UI에도 연결돼 있지 않음.
+# 영수증 OCR·자연어 입력 기능을 붙일 때 재사용 예정. (삭제 금지)
 def preprocess_image(image: Image.Image) -> Image.Image:
     width, height = image.size
     if width < 800 or height < 600:
@@ -129,6 +134,7 @@ def parse_natural_language(text: str) -> dict:
         result["date"] = datetime.now().strftime("%Y-%m-%d")
 
     return result
+# ── ⚠️ 미사용 블록 끝 ──────────────────────────────────
 
 # ── 인증 ────────────────────────────────────────
 @app.post("/auth/check-username")
@@ -244,6 +250,7 @@ async def get_expenses(month: Optional[str] = None, session: Optional[str] = Coo
         "date": {"$regex": f"^{month}"}
     }).sort("date", 1):
         doc["_id"] = str(doc["_id"])
+        doc.pop("user_id", None)  # ObjectId는 JSON 직렬화 불가 + 프론트 미사용
         expenses.append(doc)
 
     return {"expenses": expenses}
@@ -261,28 +268,116 @@ async def get_expenses_by_date(date: str, session: Optional[str] = Cookie(None))
         "date": date
     }).sort("created_at", -1):
         doc["_id"] = str(doc["_id"])
+        doc.pop("user_id", None)  # ObjectId는 JSON 직렬화 불가 + 프론트 미사용
         expenses.append(doc)
 
     return {"expenses": expenses}
 
-# ── 챗봇 ──────────────────────────────────────────
-@app.post("/chat")
-async def chat(message: str, session: Optional[str] = Cookie(None)):
+# ── 분석 (기간별 집계) ─────────────────────────────
+def get_period_range(period: str, offset: int = 0) -> tuple[str, str, str]:
+    """기간+오프셋 → (시작일, 종료일, 표시라벨). offset 0=현재, -1=직전, +1=다음.
+    날짜가 문자열이라 사전순 비교 가능."""
+    today = datetime.now()
+    if period == "week":
+        # 이번 주 월요일 ~ 일요일 (offset 주 단위 이동)
+        monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
+        sunday = monday + timedelta(days=6)
+        label = f"{monday.month}월 {monday.day}일 ~ {sunday.month}월 {sunday.day}일"
+        return monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d"), label
+    if period == "year":
+        year = today.year + offset
+        return f"{year}-01-01", f"{year}-12-31", f"{year}년"
+    # 기본: 달 단위 (offset 개월 이동, 연도 넘김 처리)
+    month_index = today.year * 12 + (today.month - 1) + offset
+    year, month = divmod(month_index, 12)
+    month += 1
+    last_day = calendar.monthrange(year, month)[1]
+    return f"{year}-{month:02d}-01", f"{year}-{month:02d}-{last_day:02d}", f"{year}년 {month}월"
+
+@app.get("/api/analysis")
+async def get_analysis(period: str = "month", offset: int = 0, session: Optional[str] = Cookie(None)):
+    """기간별(month/week/year) 카테고리 집계 + 지출 목록. offset으로 이전/다음 기간 이동."""
     user = await get_current_user(session)
     if not user:
         return JSONResponse({"error": "로그인 필요"}, status_code=401)
 
-    if "얼마" in message or "지출" in message:
-        month = datetime.now().strftime("%Y-%m")
-        expenses = await db.expenses.find({
-            "user_id": user["_id"],
-            "date": {"$regex": f"^{month}"}
-        }).to_list(None)
+    if period not in ("month", "week", "year"):
+        period = "month"
 
+    start, end, label = get_period_range(period, offset)
+
+    expenses = []
+    category_totals = {}
+    total = 0
+    async for doc in db.expenses.find({
+        "user_id": user["_id"],
+        "date": {"$gte": start, "$lte": end}
+    }).sort("date", -1):
+        doc["_id"] = str(doc["_id"])
+        doc.pop("user_id", None)  # ObjectId는 JSON 직렬화 불가 + 프론트 미사용
+        expenses.append(doc)
+        amount = doc.get("amount", 0)
+        total += amount
+        cat = doc.get("category", "기타")
+        category_totals[cat] = category_totals.get(cat, 0) + amount
+
+    by_category = sorted(
+        [{"category": c, "amount": a} for c, a in category_totals.items()],
+        key=lambda x: x["amount"],
+        reverse=True
+    )
+
+    return {
+        "period": period,
+        "offset": offset,
+        "label": label,
+        "start": start,
+        "end": end,
+        "total": total,
+        "by_category": by_category,
+        "expenses": expenses
+    }
+
+# ── 챗봇 ──────────────────────────────────────────
+@app.post("/chat")
+async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    text = message.strip()
+
+    # 지출/금액 관련 질문 처리
+    if any(kw in text for kw in ["얼마", "지출", "썼", "쓴", "총", "합계"]):
+        # 기간 파악 (기본: 이번달)
+        if any(w in text for w in ["지난달", "저번달", "전달"]):
+            period, offset, when = "month", -1, "지난달"
+        elif any(w in text for w in ["지난주", "저번주"]):
+            period, offset, when = "week", -1, "지난주"
+        elif any(w in text for w in ["이번주", "이번 주"]):
+            period, offset, when = "week", 0, "이번 주"
+        elif any(w in text for w in ["작년", "지난해"]):
+            period, offset, when = "year", -1, "작년"
+        elif any(w in text for w in ["올해", "이번해", "이번 해"]):
+            period, offset, when = "year", 0, "올해"
+        else:
+            period, offset, when = "month", 0, "이번달"
+
+        start, end, _ = get_period_range(period, offset)
+        query = {"user_id": user["_id"], "date": {"$gte": start, "$lte": end}}
+
+        # 메시지에 사용자 카테고리가 있으면 해당 카테고리만 집계
+        matched_cat = next((c for c in user.get("categories", []) if c in text), None)
+        if matched_cat:
+            query["category"] = matched_cat
+
+        expenses = await db.expenses.find(query).to_list(None)
         total = sum(e.get("amount", 0) for e in expenses)
-        return {"response": f"이번달 총 지출: {total:,}원 ({len(expenses)}건)"}
 
-    return {"response": "입력해주신 내용을 이해했습니다."}
+        cat_str = f" '{matched_cat}'" if matched_cat else ""
+        return {"response": f"{when}{cat_str} 지출: {total:,}원 ({len(expenses)}건)"}
+
+    return {"response": "지출을 물어보세요. 예: \"이번달 얼마 썼어?\", \"지난달 카페 지출\", \"올해 총 지출\""}
 
 # HTML 페이지들
 LOGIN_PAGE = """<!DOCTYPE html>
@@ -571,9 +666,17 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             .container { grid-template-columns: 1fr; }
             .calendar-day { min-height: 60px; }
         }
+
+        /* 비차단 토스트 (alert 대체) */
+        #toast-container { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 2000; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
+        .toast { background: #333; color: white; padding: 12px 20px; border-radius: 8px; font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.25); opacity: 0; transform: translateY(-10px); transition: opacity 0.25s, transform 0.25s; max-width: 90vw; }
+        .toast.show { opacity: 1; transform: translateY(0); }
+        .toast.success { background: #4CAF50; }
+        .toast.error { background: #f44336; }
     </style>
 </head>
 <body>
+    <div id="toast-container"></div>
     <div class="container">
         <div class="main">
             <div class="header">
@@ -618,9 +721,15 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             <!-- 분석 탭 -->
             <div id="analysis" class="tab-content">
                 <div class="period-buttons">
-                    <button class="active" onclick="setPeriod('month')">이번 달</button>
-                    <button onclick="setPeriod('week')">이번 주</button>
-                    <button onclick="setPeriod('year')">이번 해</button>
+                    <button class="active" onclick="setPeriod('month')">달별</button>
+                    <button onclick="setPeriod('week')">주별</button>
+                    <button onclick="setPeriod('year')">연별</button>
+                </div>
+
+                <div class="period-nav" style="display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 20px;">
+                    <button onclick="movePeriod(-1)" style="width: auto; padding: 8px 16px; margin: 0;">←</button>
+                    <span id="period-label" style="font-weight: 600; font-size: 16px; min-width: 180px; text-align: center;"></span>
+                    <button onclick="movePeriod(1)" style="width: auto; padding: 8px 16px; margin: 0;">→</button>
                 </div>
 
                 <div class="stats" id="analysis-stats">
@@ -702,6 +811,21 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     let currentMonth = new Date();
     let selectedDate = null;
     let monthExpenses = [];
+
+    // 비차단 토스트 (탭을 멈추는 alert 대체). type: '' | 'success' | 'error'
+    function showToast(message, type = '') {
+        const container = document.getElementById('toast-container');
+        if (!container) return;
+        const toast = document.createElement('div');
+        toast.className = 'toast' + (type ? ' ' + type : '');
+        toast.textContent = message;
+        container.appendChild(toast);
+        requestAnimationFrame(() => toast.classList.add('show'));
+        setTimeout(() => {
+            toast.classList.remove('show');
+            setTimeout(() => toast.remove(), 300);
+        }, 2500);
+    }
 
     // 월별 지출 데이터 로드
     async function loadExpensesAndRender() {
@@ -819,11 +943,13 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
     function selectDate(dateStr) {
         selectedDate = dateStr;
-        document.getElementById('selected-date').textContent = dateStr;
 
         // 달력 선택 상태 업데이트
         document.querySelectorAll('.calendar-day').forEach(d => d.classList.remove('selected'));
-        event.target.closest('.calendar-day').classList.add('selected');
+        if (event && event.target) {
+            const dayEl = event.target.closest('.calendar-day');
+            if (dayEl) dayEl.classList.add('selected');
+        }
 
         // 해당 날짜의 지출 내역만 표시
         showDateExpenses(dateStr);
@@ -856,23 +982,69 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             document.getElementById('selected-date-section').style.display = 'block';
         } catch (e) {
             console.error('지출 조회 오류:', e);
-            alert('지출 내역을 불러올 수 없습니다');
+            showToast('지출 내역을 불러올 수 없습니다', 'error');
         }
     }
 
+    let currentPeriod = 'month';
+    let periodOffset = 0;
+
     function setPeriod(period) {
+        currentPeriod = period;
+        periodOffset = 0;  // 기간 종류 바꾸면 현재 기간으로 리셋
         document.querySelectorAll('.period-buttons button').forEach(b => b.classList.remove('active'));
         event.target.classList.add('active');
         loadAnalysis();
     }
 
-    async function loadAnalysis() {
-        // 샘플 데이터 로드 (실제로는 서버에서 가져옴)
-        const stats = '<div class="stat-item"><span class="category">식사</span><span class="amount">45,000원</span></div><div class="stat-item"><span class="category">카페</span><span class="amount">15,000원</span></div><div class="stat-item"><span class="category">데이트</span><span class="amount">60,000원</span></div>';
-        document.getElementById('analysis-stats').innerHTML = '<h4>카테고리별 지출</h4>' + stats;
+    function movePeriod(delta) {
+        periodOffset += delta;  // -1: 이전 기간, +1: 다음 기간
+        loadAnalysis();
+    }
 
-        const table = '<tr><td>2024-06-20</td><td>서브웨이</td><td style="text-align: right;">12,000원</td><td>식사</td></tr><tr><td>2024-06-19</td><td>스타벅스</td><td style="text-align: right;">5,500원</td><td>카페</td></tr>';
-        document.getElementById('expense-table').innerHTML = table;
+    async function loadAnalysis() {
+        const statsDiv = document.getElementById('analysis-stats');
+        const tableBody = document.getElementById('expense-table');
+        const labelEl = document.getElementById('period-label');
+
+        try {
+            const response = await fetch('/api/analysis?period=' + currentPeriod + '&offset=' + periodOffset);
+            if (!response.ok) {
+                throw new Error('API 응답 실패: ' + response.status);
+            }
+            const data = await response.json();
+            const byCategory = data.by_category || [];
+            const expenses = data.expenses || [];
+            const total = data.total || 0;
+            const periodLabel = data.label || '';
+
+            // 기간 라벨 표시 (예: 2026년 7월, 6월 29일 ~ 7월 5일)
+            if (labelEl) labelEl.textContent = periodLabel;
+
+            // 카테고리별 집계
+            if (byCategory.length === 0) {
+                statsDiv.innerHTML = '<h4>카테고리별 지출 (' + periodLabel + ')</h4><div class="stat-item"><span>지출 내역이 없습니다</span></div>';
+            } else {
+                const rows = byCategory.map(c =>
+                    '<div class="stat-item"><span class="category">' + c.category + '</span><span class="amount">' + c.amount.toLocaleString() + '원</span></div>'
+                ).join('');
+                statsDiv.innerHTML = '<h4>카테고리별 지출 (' + periodLabel + ')</h4>' + rows +
+                    '<div class="stat-item" style="border-top: 2px solid #ddd; padding-top: 10px; margin-top: 10px; font-weight: 600;"><span>합계</span><span style="color: #4A90D9;">' + total.toLocaleString() + '원</span></div>';
+            }
+
+            // 지출 목록 테이블
+            if (expenses.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">지출 내역이 없습니다</td></tr>';
+            } else {
+                tableBody.innerHTML = expenses.map(e =>
+                    '<tr><td>' + e.date + '</td><td>' + e.store_name + '</td><td style="text-align: right;">' + e.amount.toLocaleString() + '원</td><td>' + e.category + '</td></tr>'
+                ).join('');
+            }
+        } catch (e) {
+            console.error('분석 데이터 로드 오류:', e);
+            statsDiv.innerHTML = '<h4>카테고리별 지출</h4><div class="stat-item"><span>데이터를 불러올 수 없습니다</span></div>';
+            tableBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">데이터를 불러올 수 없습니다</td></tr>';
+        }
     }
 
     async function addExpense() {
@@ -882,7 +1054,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const category = document.getElementById('category').value;
 
         if (!store || !amount || !date) {
-            alert('모든 항목을 입력해주세요');
+            showToast('모든 항목을 입력해주세요', 'error');
             return;
         }
 
@@ -913,43 +1085,13 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                     else btn.classList.remove('active');
                 });
 
-                alert('저장 완료!');
+                showToast('저장 완료!', 'success');
             } else {
-                alert(result.error || '저장 실패');
+                showToast(result.error || '저장 실패', 'error');
             }
         } catch (e) {
             console.error('지출 저장 오류:', e);
-            alert('오류가 발생했습니다');
-        }
-    }
-
-    async function addQuickExpense() {
-        if (!selectedDate) {
-            alert('날짜를 선택해주세요');
-            return;
-        }
-
-        const store = document.getElementById('quick-store').value;
-        const amount = document.getElementById('quick-amount').value;
-        const category = document.getElementById('quick-category').value;
-
-        if (!store || !amount) {
-            alert('가게명과 금액을 입력해주세요');
-            return;
-        }
-
-        const form = new FormData();
-        form.append('date', selectedDate);
-        form.append('store', store);
-        form.append('amount', parseInt(amount));
-        form.append('category', category);
-
-        const response = await fetch('/add/expense', {method: 'POST', body: form});
-        const result = await response.json();
-        if (result.status === 'success') {
-            document.getElementById('quick-store').value = '';
-            document.getElementById('quick-amount').value = '';
-            renderCalendar();
+            showToast('오류가 발생했습니다', 'error');
         }
     }
 
@@ -1031,7 +1173,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const newName = document.getElementById(`cat-input-${idx}`).value.trim();
 
         if (!newName) {
-            alert('카테고리명을 입력해주세요');
+            showToast('카테고리명을 입력해주세요', 'error');
             return;
         }
 
@@ -1052,7 +1194,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             updateSelectOptions(data.categories);
             editingIndex = null;
         } else {
-            alert(data.error || '오류가 발생했습니다');
+            showToast(data.error || '오류가 발생했습니다', 'error');
         }
     }
 
@@ -1087,7 +1229,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     async function addNewCategory() {
         const name = document.getElementById('newCategoryName').value.trim();
         if (!name) {
-            alert('카테고리명을 입력해주세요');
+            showToast('카테고리명을 입력해주세요', 'error');
             return;
         }
 
@@ -1102,7 +1244,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             renderCategoryList(data.categories);
             updateSelectOptions(data.categories);
         } else {
-            alert(data.error || '오류가 발생했습니다');
+            showToast(data.error || '오류가 발생했습니다', 'error');
         }
     }
 
@@ -1127,7 +1269,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             renderCategoryList(data.categories);
             updateSelectOptions(data.categories);
         } else {
-            alert(data.error || '오류가 발생했습니다');
+            showToast(data.error || '오류가 발생했습니다', 'error');
         }
     }
 

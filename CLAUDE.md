@@ -101,67 +101,27 @@ load_dotenv()
 
 ---
 
-## Phase 2 구현 완료! ✅
+## 실제 구현 현황 (2026-07-01 기준)
 
-### Step 1: 자연어 파싱 ✅
-- [x] 정규식으로 날짜/가게/금액 추출
-- [x] `/parse/text` API 엔드포인트
-- [x] `/add/parsed` 저장 엔드포인트
-- [x] 웹 UI에 자연어 입력란 추가
-- [x] 모든 저장 함수에 카테고리 필드 추가
+> ⚠️ 아래는 코드와 대조해 정정한 실제 상태입니다. (이전 문서는 실제와 달랐음)
 
-### Step 2: 영수증 OCR ✅
-- [x] EasyOCR로 이미지 → 텍스트 추출
-- [x] `/add/image` 엔드포인트 OCR 기능 추가
-- [x] OCR 결과 → 자연어 파싱
-- [x] OCR 결과를 웹에서 확인 가능
+### ✅ 실제로 동작하는 기능
+- **인증**: 회원가입/로그인/로그아웃 (세션 쿠키). 비밀번호는 현재 `sha256`(솔트 없음) — 실사용 전 `bcrypt` 교체 필요
+- **수동 지출 입력**: `/add/expense` (가게/금액/날짜/카테고리)
+- **달력 뷰**: 월별 지출을 날짜별로 표시, **날짜 클릭 시 세부내역** 표시
+- **분석 탭**: `/api/analysis?period=month|week|year&offset=N` — 기간별 카테고리 집계 + **이전/다음 기간 이동**
+- **사용자 카테고리 관리**: `/api/categories` add/delete/rename (기본값: 카페/식사/데이트/고정지출)
+- **챗봇**: `/chat` — "이번달 얼마 썼어?" 등 기간·카테고리 인식해 합계 응답
 
-**구현 코드**:
-```python
-def extract_text_from_image(image_bytes: bytes) -> str:
-    """EasyOCR로 이미지에서 한글 텍스트 추출"""
-    if reader is None:
-        return ""
-    
-    try:
-        image = Image.open(BytesIO(image_bytes))
-        results = reader.readtext(image)
-        extracted_text = " ".join([result[1] for result in results])
-        return extracted_text
-    except Exception as e:
-        print(f"OCR 오류: {e}")
-        return ""
-```
+### ⚠️ 함수만 있고 아직 화면에 안 붙은 것 (Phase 2 재연결 예정)
+- **자연어 파싱** `parse_natural_language()`: 구현돼 있으나 엔드포인트/입력란 없음 (미연결)
+- **영수증 OCR** `extract_text_from_image()` + `preprocess_image()`: 구현돼 있으나 업로드 엔드포인트/UI 없음 (미연결). OCR 모델 다운로드 실패해도 `reader=None`으로 안전 처리됨
+- **카테고리 자동분류**: 키워드 기반 `classify_expense()`는 **구현 안 됨**. 대신 사용자가 직접 카테고리를 고르는 방식으로 대체됨
 
-### Step 3: 카테고리 자동분류 ✅
-- [x] 키워드 기반 분류 규칙
-- [x] 모든 거래에 자동 분류
-- [x] 웹 UI에 카테고리 표시
-
-**분류 규칙**:
-```python
-CATEGORIES = {
-    "음식": ["카페", "식당", "서브웨이", "맥도날드", "편의점", ...],
-    "교통": ["택시", "버스", "지하철", "주유소", ...],
-    "쇼핑": ["마트", "쿠팡", "의류", "신발", ...],
-    "의료": ["약국", "병원", "치과", ...],
-    "엔터": ["영화", "극장", ...],
-    "주거": ["아파트", "월세", "전기", "가스", ...],
-}
-
-def classify_expense(store_name: str, memo: str = "") -> str:
-    """가게명/메모로 카테고리 자동 분류"""
-    search_text = (store_name + " " + memo).lower()
-    
-    for category, keywords in CATEGORIES.items():
-        if category == "기타":
-            continue
-        for keyword in keywords:
-            if keyword in search_text:
-                return category
-    
-    return "기타"
-```
+### 📌 남은 정리/개선 (계획.md 참고)
+- 비밀번호 해싱 `sha256 → bcrypt`, 입력값 검증, 지출 수정/삭제
+- AI 기능(자연어·OCR) 화면 재연결 (무료 로컬 유지)
+- Phase 3: main.py 모놀리식 → 파일 분리
 
 ---
 
@@ -169,13 +129,13 @@ def classify_expense(store_name: str, memo: str = "") -> str:
 
 ### 1. MongoDB 시작
 ```bash
-docker-compose up -d
+docker-compose up -d mongo   # mongo 서비스만 (backend 이미지 빌드는 미사용)
 # MongoDB가 localhost:27017에서 실행됨
 ```
 
 ### 2. 가상환경 + 의존성
 ```bash
-python3 -m venv venv
+python3.12 -m venv venv      # ⚠️ Python 3.12 필수 (3.14는 numpy/spacy 빌드 실패)
 source venv/bin/activate  # macOS/Linux
 # 또는
 venv\Scripts\activate     # Windows

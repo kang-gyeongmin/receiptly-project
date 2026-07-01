@@ -1,15 +1,25 @@
-fastapi==0.115.0
-uvicorn==0.30.6
+# Receiptly 의존성 (Python 3.12 기준)
+# ⚠️ Python 3.14에서는 numpy/spacy 빌드 실패 → 3.12 권장
+
+# 웹 백엔드
+fastapi==0.138.2
+uvicorn==0.49.0
+python-multipart==0.0.32
+pydantic==2.13.4
+
+# MongoDB (motor 3.3.2는 pymongo <4.7 과만 호환)
 motor==3.3.2
 pymongo==4.6.3
-pydantic==2.9.2
-python-dotenv==1.0.1
-python-multipart==0.0.12
-easyocr==1.7.1
-spacy==3.7.2
-Pillow==10.1.0
-numpy==1.24.3
-PyJWT==2.8.1
-python-jose==3.3.0
-passlib==1.7.4
-bcrypt==4.1.2
+
+# 환경변수
+python-dotenv==1.2.2
+
+# OCR (현재 코드에 미연결 — Phase 2 재연결 예정)
+easyocr==1.7.2
+Pillow==12.3.0
+numpy==2.5.0
+
+# ── 제거됨 (코드에서 미사용) ──
+#   spacy, PyJWT, python-jose, passlib
+# ── 나중에 비밀번호 해싱 sha256 → bcrypt 교체 시 추가 ──
+#   bcrypt==4.1.2
