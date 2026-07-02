@@ -302,10 +302,13 @@ async def home(session: Optional[str] = Cookie(None)):
 
 # ── 데이터 저장 ────────────────────────────────────
 @app.post("/add/expense")
-async def add_expense(date: str = Form(...), store: str = Form(...), amount: int = Form(...), category: str = Form(...), session: Optional[str] = Cookie(None)):
+async def add_expense(date: str = Form(...), store: str = Form(...), amount: int = Form(...), category: str = Form(...), kind: str = Form("expense"), session: Optional[str] = Cookie(None)):
     user = await get_current_user(session)
     if not user:
         return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    if kind not in ("expense", "income"):
+        kind = "expense"
 
     doc = {
         "user_id": user["_id"],
@@ -313,6 +316,7 @@ async def add_expense(date: str = Form(...), store: str = Form(...), amount: int
         "store_name": store,
         "amount": amount,
         "category": category,
+        "kind": kind,  # "expense" | "income"
         "created_at": datetime.now().isoformat()
     }
     await db.expenses.insert_one(doc)
@@ -437,8 +441,9 @@ async def get_analysis(period: str = "month", offset: int = 0, session: Optional
     start, end, label = get_period_range(period, offset)
 
     expenses = []
-    category_totals = {}
-    total = 0
+    category_totals = {}   # 지출 카테고리별
+    expense_total = 0
+    income_total = 0
     async for doc in db.expenses.find({
         "user_id": user["_id"],
         "date": {"$gte": start, "$lte": end}
@@ -447,9 +452,12 @@ async def get_analysis(period: str = "month", offset: int = 0, session: Optional
         doc.pop("user_id", None)  # ObjectId는 JSON 직렬화 불가 + 프론트 미사용
         expenses.append(doc)
         amount = doc.get("amount", 0)
-        total += amount
-        cat = doc.get("category", "기타")
-        category_totals[cat] = category_totals.get(cat, 0) + amount
+        if doc.get("kind") == "income":
+            income_total += amount
+        else:  # 기본: 지출 (기존 데이터에 kind 없으면 지출로 간주)
+            expense_total += amount
+            cat = doc.get("category", "기타")
+            category_totals[cat] = category_totals.get(cat, 0) + amount
 
     by_category = sorted(
         [{"category": c, "amount": a} for c, a in category_totals.items()],
@@ -463,7 +471,10 @@ async def get_analysis(period: str = "month", offset: int = 0, session: Optional
         "label": label,
         "start": start,
         "end": end,
-        "total": total,
+        "total": expense_total,        # 하위호환: 기존 total = 지출 합계
+        "expense_total": expense_total,
+        "income_total": income_total,
+        "net": income_total - expense_total,
         "by_category": by_category,
         "expenses": expenses
     }
@@ -525,6 +536,9 @@ async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
     if not is_query:
         parsed = parse_natural_language(text)
         if parsed["amount"] is not None and parsed["store_name"]:
+            # 수입 키워드가 있으면 income으로 판단
+            income_kws = ["입금", "월급", "급여", "용돈", "수입", "보너스", "상여", "이체받", "받음", "환급"]
+            kind = "income" if any(k in text for k in income_kws) else "expense"
             category = await classify_expense(user, parsed["store_name"])
             return {
                 "type": "confirm",
@@ -533,6 +547,7 @@ async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
                     "store": parsed["store_name"],
                     "amount": parsed["amount"],
                     "category": category,
+                    "kind": kind,
                 },
                 "categories": user.get("categories", DEFAULT_CATEGORIES),
                 "response": f"이렇게 저장할까요?",
@@ -598,6 +613,7 @@ async def chat_image(file: UploadFile = File(...), session: Optional[str] = Cook
             "store": parsed["store_name"] or "",
             "amount": parsed["amount"],
             "category": category,
+            "kind": "expense",
         },
         "categories": user.get("categories", DEFAULT_CATEGORIES),
         "response": "영수증에서 읽었어요. 확인 후 저장하세요.",
@@ -981,7 +997,11 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
         <!-- 사이드바 -->
         <div class="sidebar">
-            <h3>✏️ 지출 입력</h3>
+            <h3>✏️ 입력</h3>
+            <div style="display:flex; gap:5px; margin:8px 0;">
+                <button type="button" id="kind-expense" onclick="setKind('expense')" style="flex:1; margin:0; background:#4A90D9;">지출</button>
+                <button type="button" id="kind-income" onclick="setKind('income')" style="flex:1; margin:0; background:#ccc;">수입</button>
+            </div>
             <input type="text" id="store" placeholder="가게명" />
             <input type="number" id="amount" placeholder="금액" />
             <input type="date" id="date" />
@@ -1145,17 +1165,23 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             }
 
             const categoryTotals = {};
+            let incomeTotal = 0;
             dayExpenses.forEach(e => {
-                if (!categoryTotals[e.category]) {
-                    categoryTotals[e.category] = 0;
+                if (e.kind === 'income') {
+                    incomeTotal += e.amount;
+                } else {
+                    if (!categoryTotals[e.category]) categoryTotals[e.category] = 0;
+                    categoryTotals[e.category] += e.amount;
                 }
-                categoryTotals[e.category] += e.amount;
             });
 
             // HTML 구성
             let html = '<div class="date">' + day + '</div>';
             if (dayExpenses.length > 0) {
                 html += '<div style="font-size: 11px; margin-top: 4px;">';
+                if (incomeTotal > 0) {
+                    html += '<div style="color: #2e7d32; margin-bottom: 2px;">+' + incomeTotal.toLocaleString() + '원</div>';
+                }
                 for (const [cat, total] of Object.entries(categoryTotals)) {
                     html += '<div style="color: #666; margin-bottom: 2px;">' + cat + ' ' + total.toLocaleString() + '원</div>';
                 }
@@ -1228,19 +1254,27 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                             '</div>' +
                         '</div>';
                 } else {
+                    const isIncome = e.kind === 'income';
+                    const amtColor = isIncome ? '#2e7d32' : '#4A90D9';
+                    const amtText = (isIncome ? '+' : '') + e.amount.toLocaleString() + '원';
+                    const tag = isIncome ? ' <span style="font-size:11px; color:#2e7d32;">[수입]</span>' : '';
                     html +=
                         '<div class="stat-item">' +
-                            '<span class="category">' + escapeHtml(e.store_name) + ' <span style="font-size:12px; color:#999;">(' + escapeHtml(e.category) + ')</span></span>' +
+                            '<span class="category">' + escapeHtml(e.store_name) + tag + ' <span style="font-size:12px; color:#999;">(' + escapeHtml(e.category) + ')</span></span>' +
                             '<span style="display:flex; align-items:center; gap:6px;">' +
-                                '<span class="amount">' + e.amount.toLocaleString() + '원</span>' +
+                                '<span class="amount" style="color:' + amtColor + ';">' + amtText + '</span>' +
                                 '<button onclick="startEditExpense(' + i + ')" style="width:auto; margin:0; padding:3px 8px; font-size:11px; background:#FF9800;">수정</button>' +
                                 '<button onclick="deleteExpense(' + i + ')" style="width:auto; margin:0; padding:3px 8px; font-size:11px; background:#f44336;">삭제</button>' +
                             '</span>' +
                         '</div>';
                 }
             });
-            const total = dateExpenses.reduce((s, e) => s + e.amount, 0);
-            html += '<div class="stat-item" style="border-top:2px solid #ddd; padding-top:10px; margin-top:10px; font-weight:600;"><span>합계</span><span style="color:#4A90D9;">' + total.toLocaleString() + '원</span></div>';
+            const expTotal = dateExpenses.filter(e => e.kind !== 'income').reduce((s, e) => s + e.amount, 0);
+            const incTotal = dateExpenses.filter(e => e.kind === 'income').reduce((s, e) => s + e.amount, 0);
+            html += '<div class="stat-item" style="border-top:2px solid #ddd; padding-top:10px; margin-top:10px; font-weight:600;"><span>지출 합계</span><span style="color:#4A90D9;">' + expTotal.toLocaleString() + '원</span></div>';
+            if (incTotal > 0) {
+                html += '<div class="stat-item" style="font-weight:600;"><span>수입 합계</span><span style="color:#2e7d32;">+' + incTotal.toLocaleString() + '원</span></div>';
+            }
         }
 
         statsDiv.innerHTML = html;
@@ -1334,30 +1368,50 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             // 기간 라벨 표시 (예: 2026년 7월, 6월 29일 ~ 7월 5일)
             if (labelEl) labelEl.textContent = periodLabel;
 
-            // 카테고리별 집계
+            // 수입/지출/순수지 요약 + 카테고리별 지출
+            const incomeTotal = data.income_total || 0;
+            const expenseTotal = data.expense_total || 0;
+            const net = data.net || 0;
+            const netColor = net >= 0 ? '#2e7d32' : '#f44336';
+
+            let statsHtml = '<h4>' + periodLabel + '</h4>' +
+                '<div class="stat-item"><span>수입</span><span style="color:#2e7d32; font-weight:600;">+' + incomeTotal.toLocaleString() + '원</span></div>' +
+                '<div class="stat-item"><span>지출</span><span style="color:#4A90D9; font-weight:600;">-' + expenseTotal.toLocaleString() + '원</span></div>' +
+                '<div class="stat-item" style="border-top:2px solid #ddd; padding-top:8px; margin-top:4px;"><span style="font-weight:600;">순수지</span><span style="color:' + netColor + '; font-weight:700;">' + (net >= 0 ? '+' : '') + net.toLocaleString() + '원</span></div>' +
+                '<div style="font-size:13px; font-weight:600; margin:14px 0 4px;">카테고리별 지출</div>';
             if (byCategory.length === 0) {
-                statsDiv.innerHTML = '<h4>카테고리별 지출 (' + periodLabel + ')</h4><div class="stat-item"><span>지출 내역이 없습니다</span></div>';
+                statsHtml += '<div class="stat-item"><span>지출 내역이 없습니다</span></div>';
             } else {
-                const rows = byCategory.map(c =>
+                statsHtml += byCategory.map(c =>
                     '<div class="stat-item"><span class="category">' + c.category + '</span><span class="amount">' + c.amount.toLocaleString() + '원</span></div>'
                 ).join('');
-                statsDiv.innerHTML = '<h4>카테고리별 지출 (' + periodLabel + ')</h4>' + rows +
-                    '<div class="stat-item" style="border-top: 2px solid #ddd; padding-top: 10px; margin-top: 10px; font-weight: 600;"><span>합계</span><span style="color: #4A90D9;">' + total.toLocaleString() + '원</span></div>';
             }
+            statsDiv.innerHTML = statsHtml;
 
-            // 지출 목록 테이블
+            // 내역 테이블 (수입은 초록 +)
             if (expenses.length === 0) {
-                tableBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">지출 내역이 없습니다</td></tr>';
+                tableBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">내역이 없습니다</td></tr>';
             } else {
-                tableBody.innerHTML = expenses.map(e =>
-                    '<tr><td>' + e.date + '</td><td>' + e.store_name + '</td><td style="text-align: right;">' + e.amount.toLocaleString() + '원</td><td>' + e.category + '</td></tr>'
-                ).join('');
+                tableBody.innerHTML = expenses.map(e => {
+                    const inc = e.kind === 'income';
+                    const amtCell = '<td style="text-align:right; color:' + (inc ? '#2e7d32' : '#333') + ';">' + (inc ? '+' : '') + e.amount.toLocaleString() + '원</td>';
+                    const catCell = '<td>' + (inc ? '수입' : e.category) + '</td>';
+                    return '<tr><td>' + e.date + '</td><td>' + e.store_name + '</td>' + amtCell + catCell + '</tr>';
+                }).join('');
             }
         } catch (e) {
             console.error('분석 데이터 로드 오류:', e);
             statsDiv.innerHTML = '<h4>카테고리별 지출</h4><div class="stat-item"><span>데이터를 불러올 수 없습니다</span></div>';
             tableBody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #999;">데이터를 불러올 수 없습니다</td></tr>';
         }
+    }
+
+    let inputKind = 'expense';  // 사이드바 입력 종류
+    function setKind(k) {
+        inputKind = k;
+        document.getElementById('kind-expense').style.background = (k === 'expense') ? '#4A90D9' : '#ccc';
+        document.getElementById('kind-income').style.background = (k === 'income') ? '#2e7d32' : '#ccc';
+        document.getElementById('store').placeholder = (k === 'income') ? '수입원 (예: 월급)' : '가게명';
     }
 
     async function addExpense() {
@@ -1376,6 +1430,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         form.append('store', store);
         form.append('amount', parseInt(amount));
         form.append('category', category);
+        form.append('kind', inputKind);
 
         try {
             const response = await fetch('/add/expense', {method: 'POST', body: form});
@@ -1492,6 +1547,11 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         messages.innerHTML +=
             '<div class="chat-message bot" id="' + id + '" style="text-align:left;">' +
                 '<div style="font-weight:600; margin-bottom:4px;">이렇게 저장할까요? <span style="font-weight:400; color:#888; font-size:12px;">(수정 가능)</span></div>' +
+                '<label style="' + labelStyle + '">📂 종류</label>' +
+                '<select id="' + id + '-kind" style="' + inputStyle + '">' +
+                    '<option value="expense"' + (expense.kind === 'income' ? '' : ' selected') + '>지출</option>' +
+                    '<option value="income"' + (expense.kind === 'income' ? ' selected' : '') + '>수입</option>' +
+                '</select>' +
                 '<label style="' + labelStyle + '">📅 날짜</label>' +
                 '<input type="date" id="' + id + '-date" value="' + escapeHtml(expense.date) + '" style="' + inputStyle + '" />' +
                 '<label style="' + labelStyle + '">🏪 가게</label>' +
@@ -1544,6 +1604,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const store = document.getElementById(id + '-store').value.trim();
         const amount = document.getElementById(id + '-amount').value;
         const category = document.getElementById(id + '-cat').value;
+        const kind = document.getElementById(id + '-kind').value;
 
         if (!date || !store || !amount) { showToast('날짜·가게·금액을 입력해주세요', 'error'); return; }
         if (parseInt(amount) <= 0) { showToast('금액은 1원 이상이어야 합니다', 'error'); return; }
@@ -1553,15 +1614,17 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         form.append('store', store);
         form.append('amount', parseInt(amount));
         form.append('category', category);
+        form.append('kind', kind);
 
         try {
             const res = await fetch('/add/expense', {method: 'POST', body: form});
             const result = await res.json();
             const card = document.getElementById(id);
             if (result.status === 'success') {
-                if (card) card.outerHTML = '<div class="chat-message bot">✅ 저장 완료: ' +
+                const kindLabel = kind === 'income' ? '수입' : '지출';
+                if (card) card.outerHTML = '<div class="chat-message bot">✅ ' + kindLabel + ' 저장 완료: ' +
                     escapeHtml(date) + ' · ' + escapeHtml(store) + ' · ' +
-                    Number(amount).toLocaleString() + '원 · ' + escapeHtml(category) + '</div>';
+                    Number(amount).toLocaleString() + '원 · ' + escapeHtml(kind === 'income' ? '수입' : category) + '</div>';
                 delete pendingExpenses[n];
                 // 저장한 날짜의 달로 달력 갱신
                 const d = new Date(date);
