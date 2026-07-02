@@ -1,6 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+from bson.errors import InvalidId
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
@@ -272,6 +274,52 @@ async def get_expenses_by_date(date: str, session: Optional[str] = Cookie(None))
         expenses.append(doc)
 
     return {"expenses": expenses}
+
+@app.post("/api/expenses/update")
+async def update_expense(
+    id: str = Form(...),
+    store: str = Form(...),
+    amount: int = Form(...),
+    category: str = Form(...),
+    session: Optional[str] = Cookie(None),
+):
+    """지출 수정 (본인 소유만). 날짜는 그대로 두고 가게/금액/카테고리만 변경."""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    if amount <= 0:
+        return JSONResponse({"error": "금액은 1원 이상이어야 합니다"}, status_code=400)
+
+    try:
+        oid = ObjectId(id)
+    except InvalidId:
+        return JSONResponse({"error": "잘못된 지출 id입니다"}, status_code=400)
+
+    result = await db.expenses.update_one(
+        {"_id": oid, "user_id": user["_id"]},
+        {"$set": {"store_name": store, "amount": amount, "category": category}},
+    )
+    if result.matched_count == 0:
+        return JSONResponse({"error": "지출 내역을 찾을 수 없습니다"}, status_code=404)
+    return {"status": "success"}
+
+@app.post("/api/expenses/delete")
+async def delete_expense(id: str = Form(...), session: Optional[str] = Cookie(None)):
+    """지출 삭제 (본인 소유만)."""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    try:
+        oid = ObjectId(id)
+    except InvalidId:
+        return JSONResponse({"error": "잘못된 지출 id입니다"}, status_code=400)
+
+    result = await db.expenses.delete_one({"_id": oid, "user_id": user["_id"]})
+    if result.deleted_count == 0:
+        return JSONResponse({"error": "지출 내역을 찾을 수 없습니다"}, status_code=404)
+    return {"status": "success"}
 
 # ── 분석 (기간별 집계) ─────────────────────────────
 def get_period_range(period: str, offset: int = 0) -> tuple[str, str, str]:
@@ -872,6 +920,9 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     let currentMonth = new Date();
     let selectedDate = null;
     let monthExpenses = [];
+    let dateExpenses = [];          // 선택된 날짜의 지출 목록
+    let editingExpenseIndex = null; // 인라인 수정 중인 항목 인덱스
+    let userCategories = [];        // 사용자 카테고리 (수정/추가 드롭다운용)
 
     // 비차단 토스트 (탭을 멈추는 alert 대체). type: '' | 'success' | 'error'
     function showToast(message, type = '') {
@@ -1018,33 +1069,117 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
     async function showDateExpenses(dateStr) {
         try {
-            console.log('📋 조회: ' + dateStr);
-
             const response = await fetch('/api/expenses/by-date?date=' + dateStr);
-            if (!response.ok) {
-                throw new Error('API 응답 실패: ' + response.status);
-            }
-
+            if (!response.ok) throw new Error('API 응답 실패: ' + response.status);
             const data = await response.json();
-            const expenses = data.expenses || [];
-
-            console.log('✅ ' + dateStr + ' 지출: ' + expenses.length + '개');
-
-            const statsDiv = document.getElementById('selected-date-stats');
-            if (expenses.length === 0) {
-                statsDiv.innerHTML = '<h4>📅 ' + dateStr + ' 지출 내역</h4><div class="stat-item"><span>이 날짜에 지출이 없습니다</span></div>';
-            } else {
-                const total = expenses.reduce((sum, e) => sum + e.amount, 0);
-                const html = '<h4>📅 ' + dateStr + ' 지출 내역 (' + expenses.length + '건)</h4>' +
-                    expenses.map(e => `<div class="stat-item"><span class="category">${e.store_name} <span style="font-size: 12px; color: #999;">(${e.category})</span></span><span class="amount">${e.amount.toLocaleString()}원</span></div>`).join('') +
-                    `<div class="stat-item" style="border-top: 2px solid #ddd; padding-top: 10px; margin-top: 10px; font-weight: 600;"><span>합계</span><span style="color: #4A90D9;">${total.toLocaleString()}원</span></div>`;
-                statsDiv.innerHTML = html;
-            }
+            dateExpenses = data.expenses || [];
+            editingExpenseIndex = null;
+            renderDateExpenses(dateStr);
             document.getElementById('selected-date-section').style.display = 'block';
         } catch (e) {
             console.error('지출 조회 오류:', e);
             showToast('지출 내역을 불러올 수 없습니다', 'error');
         }
+    }
+
+    function catOptions(selected) {
+        return userCategories.map(c =>
+            '<option value="' + escapeHtml(c) + '"' + (c === selected ? ' selected' : '') + '>' + escapeHtml(c) + '</option>'
+        ).join('');
+    }
+
+    // 선택된 날짜의 지출 목록 렌더 (수정/삭제 버튼 + 추가 폼)
+    function renderDateExpenses(dateStr) {
+        const statsDiv = document.getElementById('selected-date-stats');
+        let html = '<h4>📅 ' + dateStr + ' 지출 내역 (' + dateExpenses.length + '건)</h4>';
+
+        if (dateExpenses.length === 0) {
+            html += '<div class="stat-item"><span>이 날짜에 지출이 없습니다</span></div>';
+        } else {
+            dateExpenses.forEach((e, i) => {
+                if (i === editingExpenseIndex) {
+                    html +=
+                        '<div class="stat-item" style="flex-direction:column; align-items:stretch; gap:5px;">' +
+                            '<input id="edit-store" value="' + escapeHtml(e.store_name) + '" style="margin:0; padding:6px; font-size:13px;" />' +
+                            '<div style="display:flex; gap:5px;">' +
+                                '<input id="edit-amount" type="number" value="' + e.amount + '" style="margin:0; padding:6px; font-size:13px; flex:1;" />' +
+                                '<select id="edit-cat" style="margin:0; padding:6px; font-size:13px; flex:1;">' + catOptions(e.category) + '</select>' +
+                            '</div>' +
+                            '<div style="display:flex; gap:5px;">' +
+                                '<button onclick="saveEditExpense(' + i + ')" style="flex:1; margin:0; padding:6px; font-size:12px;">저장</button>' +
+                                '<button onclick="cancelEditExpense()" style="flex:1; margin:0; padding:6px; font-size:12px; background:#999;">취소</button>' +
+                            '</div>' +
+                        '</div>';
+                } else {
+                    html +=
+                        '<div class="stat-item">' +
+                            '<span class="category">' + escapeHtml(e.store_name) + ' <span style="font-size:12px; color:#999;">(' + escapeHtml(e.category) + ')</span></span>' +
+                            '<span style="display:flex; align-items:center; gap:6px;">' +
+                                '<span class="amount">' + e.amount.toLocaleString() + '원</span>' +
+                                '<button onclick="startEditExpense(' + i + ')" style="width:auto; margin:0; padding:3px 8px; font-size:11px; background:#FF9800;">수정</button>' +
+                                '<button onclick="deleteExpense(' + i + ')" style="width:auto; margin:0; padding:3px 8px; font-size:11px; background:#f44336;">삭제</button>' +
+                            '</span>' +
+                        '</div>';
+                }
+            });
+            const total = dateExpenses.reduce((s, e) => s + e.amount, 0);
+            html += '<div class="stat-item" style="border-top:2px solid #ddd; padding-top:10px; margin-top:10px; font-weight:600;"><span>합계</span><span style="color:#4A90D9;">' + total.toLocaleString() + '원</span></div>';
+        }
+
+        statsDiv.innerHTML = html;
+    }
+
+    function startEditExpense(i) {
+        editingExpenseIndex = i;
+        renderDateExpenses(selectedDate);
+    }
+
+    function cancelEditExpense() {
+        editingExpenseIndex = null;
+        renderDateExpenses(selectedDate);
+    }
+
+    async function saveEditExpense(i) {
+        const e = dateExpenses[i];
+        const store = document.getElementById('edit-store').value.trim();
+        const amount = document.getElementById('edit-amount').value;
+        const category = document.getElementById('edit-cat').value;
+        if (!store || !amount) { showToast('가게명과 금액을 입력해주세요', 'error'); return; }
+
+        const form = new FormData();
+        form.append('id', e._id);
+        form.append('store', store);
+        form.append('amount', parseInt(amount));
+        form.append('category', category);
+        try {
+            const res = await fetch('/api/expenses/update', {method: 'POST', body: form});
+            const result = await res.json();
+            if (result.status === 'success') {
+                editingExpenseIndex = null;
+                showToast('수정 완료', 'success');
+                await showDateExpenses(selectedDate);
+                loadExpensesAndRender();
+            } else {
+                showToast(result.error || '수정 실패', 'error');
+            }
+        } catch (err) { showToast('수정 중 오류가 발생했습니다', 'error'); }
+    }
+
+    async function deleteExpense(i) {
+        const e = dateExpenses[i];
+        const form = new FormData();
+        form.append('id', e._id);
+        try {
+            const res = await fetch('/api/expenses/delete', {method: 'POST', body: form});
+            const result = await res.json();
+            if (result.status === 'success') {
+                showToast('삭제 완료', 'success');
+                await showDateExpenses(selectedDate);
+                loadExpensesAndRender();
+            } else {
+                showToast(result.error || '삭제 실패', 'error');
+            }
+        } catch (err) { showToast('삭제 중 오류가 발생했습니다', 'error'); }
     }
 
     let currentPeriod = 'month';
@@ -1273,6 +1408,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             const response = await fetch('/api/categories');
             const data = await response.json();
             if (data.categories) {
+                userCategories = data.categories;
                 updateSelectOptions(data.categories);
                 if (document.getElementById('categoryList')) {
                     renderCategoryList(data.categories);
