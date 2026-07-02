@@ -10,10 +10,16 @@ import re
 import calendar
 import hashlib
 import secrets
+import ssl
+import certifi
 from typing import Optional
 import easyocr
+import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
 from io import BytesIO
+
+# macOS 파이썬은 시스템 인증서를 안 써서 EasyOCR 모델 다운로드가 SSL 오류남 → certifi 사용
+ssl._create_default_https_context = lambda *a, **k: ssl.create_default_context(cafile=certifi.where())
 
 load_dotenv()
 
@@ -94,7 +100,7 @@ def extract_text_from_image(image_bytes: bytes) -> str:
     try:
         image = Image.open(BytesIO(image_bytes))
         image = preprocess_image(image)
-        results = reader.readtext(image, detail=1)
+        results = reader.readtext(np.array(image), detail=1)  # EasyOCR은 numpy 배열 필요
         lines = []
         for result in results:
             text = result[1]
@@ -108,6 +114,53 @@ def extract_text_from_image(image_bytes: bytes) -> str:
     except Exception as e:
         print(f"OCR 오류: {e}")
         return ""
+
+# 영수증/결제내역 OCR 텍스트에서 지출 정보 추출 (best-effort, 확인 카드로 교정 전제)
+RECEIPT_STOPWORDS = [
+    "승인", "금액", "합계", "카드", "일시불", "할부", "매출", "가맹점", "결제", "부가세",
+    "공급가", "잔액", "포인트", "적립", "거래", "번호", "판매", "영수증", "고객", "신용",
+    "체크", "은행", "원", "총액", "받을", "주소", "전화", "대표",
+]
+
+def extract_expense_from_ocr(text: str) -> dict:
+    """OCR 텍스트 → {date, store_name, amount}. 금액은 최댓값(=결제총액 추정)."""
+    result = {"date": None, "store_name": None, "amount": None, "memo": ""}
+
+    # ── 금액: '원' 붙은 금액 우선, 없으면 콤마 3자리 그룹 숫자. 그 중 최댓값 ──
+    amounts = [int(m.group(1).replace(',', '')) for m in re.finditer(r'([\d,]{2,})\s*원', text)]
+    if not amounts:
+        amounts = [int(m.group(1).replace(',', '')) for m in re.finditer(r'(\d{1,3}(?:,\d{3})+)', text)]
+    if amounts:
+        result["amount"] = max(amounts)
+
+    # ── 날짜: YYYY.MM.DD / YYYY-MM-DD / YYYY년 M월 D일 우선, 없으면 M월 D일 / M/D ──
+    m = re.search(r'(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})', text)
+    if m:
+        result["date"] = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    else:
+        m = re.search(r'(\d{1,2})\s*월\s*(\d{1,2})\s*일', text) or re.search(r'(\d{1,2})[/-](\d{1,2})', text)
+        if m:
+            today = datetime.now()
+            mo, d = int(m.group(1)), int(m.group(2))
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                yr = today.year - (1 if mo > today.month else 0)
+                result["date"] = f"{yr}-{mo:02d}-{d:02d}"
+    if not result["date"]:
+        result["date"] = datetime.now().strftime("%Y-%m-%d")
+
+    # ── 가게명: 한글 2자 이상 토큰 중 불용어/숫자 아닌 첫 후보 ──
+    for tok in text.split():
+        t = tok.strip(" .,·-()[]")
+        if len(t) < 2 or re.search(r'\d', t):
+            continue
+        if not re.search(r'[가-힣]', t):
+            continue
+        if any(sw in t for sw in RECEIPT_STOPWORDS):
+            continue
+        result["store_name"] = t
+        break
+
+    return result
 
 # ── ⚠️ OCR 미사용 블록 끝 ──────────────────────────────
 
@@ -517,6 +570,39 @@ async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
 
     return {"type": "message", "response": "지출을 물어보거나(\"이번달 얼마 썼어?\") 저장할 내역을 입력하세요(\"6/30 샐러디 9900원\")."}
 
+@app.post("/chat/image")
+async def chat_image(file: UploadFile = File(...), session: Optional[str] = Cookie(None)):
+    """결제내역/영수증 사진 → OCR → 파싱 → 확인 카드 (저장은 확인 후)"""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+
+    if reader is None:
+        return {"type": "message", "response": "OCR이 준비되지 않았어요. 서버 로그를 확인해주세요."}
+
+    image_bytes = await file.read()
+    text = extract_text_from_image(image_bytes)
+    if not text:
+        return {"type": "message", "response": "사진에서 글자를 읽지 못했어요. 더 밝고 선명한 사진으로 다시 시도해주세요."}
+
+    parsed = extract_expense_from_ocr(text)
+    if parsed["amount"] is None:
+        preview = text[:120]
+        return {"type": "message", "response": f"금액을 찾지 못했어요. 인식된 내용: {preview}"}
+
+    category = await classify_expense(user, parsed["store_name"] or "")
+    return {
+        "type": "confirm",
+        "expense": {
+            "date": parsed["date"],
+            "store": parsed["store_name"] or "",
+            "amount": parsed["amount"],
+            "category": category,
+        },
+        "categories": user.get("categories", DEFAULT_CATEGORIES),
+        "response": "영수증에서 읽었어요. 확인 후 저장하세요.",
+    }
+
 # HTML 페이지들
 LOGIN_PAGE = """<!DOCTYPE html>
 <html>
@@ -918,6 +1004,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                     <div class="chat-message bot">안녕하세요! 지출을 물어보거나("이번달 얼마 썼어?") 바로 입력해 저장할 수 있어요.<br>예: "6/30 샐러디 9900원"</div>
                 </div>
                 <div class="chat-input">
+                    <input type="file" id="chat-image" accept="image/*" style="display:none;" onchange="sendChatImage(this)" />
+                    <button onclick="document.getElementById('chat-image').click()" title="영수증 사진" style="width:40px; padding:8px;">📷</button>
                     <input type="text" id="chat-input" placeholder="예: 6/30 샐러디 9900원" onkeypress="if(event.key=='Enter') sendChat()" />
                     <button onclick="sendChat()">→</button>
                 </div>
@@ -1352,6 +1440,40 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             }
         } catch (e) {
             messages.innerHTML += '<div class="chat-message bot">오류가 발생했어요. 다시 시도해주세요.</div>';
+        }
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    // 영수증 사진 업로드 → OCR → 확인 카드
+    async function sendChatImage(inputEl) {
+        const fileEl = inputEl || document.getElementById('chat-image');
+        const file = fileEl.files && fileEl.files[0];
+        if (!file) return;
+
+        const messages = document.getElementById('messages');
+        messages.innerHTML += '<div class="chat-message user">📷 ' + escapeHtml(file.name) + '</div>';
+        messages.innerHTML += '<div class="chat-message bot" id="ocr-loading">영수증을 읽는 중...</div>';
+        messages.scrollTop = messages.scrollHeight;
+        fileEl.value = '';  // 같은 파일 다시 선택 가능하도록
+
+        try {
+            const form = new FormData();
+            form.append('file', file);
+            const res = await fetch('/chat/image', {method: 'POST', body: form});
+            const data = await res.json();
+
+            const loading = document.getElementById('ocr-loading');
+            if (loading) loading.remove();
+
+            if (data.type === 'confirm' && data.expense) {
+                renderConfirmCard(data.expense, data.categories || []);
+            } else {
+                messages.innerHTML += '<div class="chat-message bot">' + (data.response || '') + '</div>';
+            }
+        } catch (e) {
+            const loading = document.getElementById('ocr-loading');
+            if (loading) loading.remove();
+            messages.innerHTML += '<div class="chat-message bot">사진 처리 중 오류가 발생했어요.</div>';
         }
         messages.scrollTop = messages.scrollHeight;
     }

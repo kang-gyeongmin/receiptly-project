@@ -14,10 +14,11 @@ pymongo==4.6.3
 # 환경변수
 python-dotenv==1.2.2
 
-# OCR (현재 코드에 미연결 — Phase 2 재연결 예정)
+# OCR (챗봇 영수증 사진 인식)
 easyocr==1.7.2
 Pillow==12.3.0
 numpy==2.5.0
+certifi  # macOS SSL 인증서 (EasyOCR 모델 다운로드)
 
 # ── 제거됨 (코드에서 미사용) ──
 #   spacy, PyJWT, python-jose, passlib
