@@ -62,10 +62,10 @@ async def get_current_user(session: Optional[str] = Cookie(None)):
         return None
     return await db.users.find_one({"_id": session_doc["user_id"]})
 
-# ── ⚠️ 미사용 (Phase 2 재연결 예정) ────────────────────
-# 아래 3개 함수(preprocess_image / extract_text_from_image / parse_natural_language)는
-# 구현돼 있지만 현재 어떤 엔드포인트/UI에도 연결돼 있지 않음.
-# 영수증 OCR·자연어 입력 기능을 붙일 때 재사용 예정. (삭제 금지)
+# ── ⚠️ OCR 미사용 (Phase B 재연결 예정) ────────────────
+# preprocess_image / extract_text_from_image 는 구현돼 있으나 아직 엔드포인트/UI 미연결.
+# 영수증 캡처 기능 붙일 때 재사용 예정. (삭제 금지)
+# ※ parse_natural_language 는 챗봇 자연어 저장에 실제 사용 중 (아래 별도 섹션).
 def preprocess_image(image: Image.Image) -> Image.Image:
     width, height = image.size
     if width < 800 or height < 600:
@@ -109,26 +109,56 @@ def extract_text_from_image(image_bytes: bytes) -> str:
         print(f"OCR 오류: {e}")
         return ""
 
+# ── ⚠️ OCR 미사용 블록 끝 ──────────────────────────────
+
+# ── 자연어 파싱 (챗봇 저장에 사용) ──────────────────────
+def _extract_amount(s: str):
+    """문자열 끝에서 금액을 추출. 만/천 단위, 콤마, '원' 지원.
+    반환: (금액 or None, 금액 제거된 문자열)"""
+    s2 = s.rstrip()
+    patterns = [
+        (r'(\d+)\s*만\s*(\d+)\s*천\s*원?$', lambda m: int(m.group(1)) * 10000 + int(m.group(2)) * 1000),
+        (r'(\d+)\s*만\s*원?$',             lambda m: int(m.group(1)) * 10000),
+        (r'(\d+)\s*천\s*원?$',             lambda m: int(m.group(1)) * 1000),
+        (r'([\d,]+)\s*원$',                lambda m: int(m.group(1).replace(',', ''))),
+        (r'(\d[\d,]*)$',                   lambda m: int(m.group(1).replace(',', ''))),
+    ]
+    for pat, conv in patterns:
+        m = re.search(pat, s2)
+        if m:
+            return conv(m), s2[:m.start()]
+    return None, s
+
+def _extract_date(s: str):
+    """'M월 D일' 또는 'M/D', 'M-D' 형식 추출. 반환: (YYYY-MM-DD or None, 날짜 제거된 문자열)"""
+    m = re.search(r'(\d{1,2})\s*월\s*(\d{1,2})\s*일?', s)
+    if not m:
+        m = re.search(r'(\d{1,2})[/-](\d{1,2})', s)
+    if not m:
+        return None, s
+    month, day = int(m.group(1)), int(m.group(2))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None, s
+    today = datetime.now()
+    year = today.year
+    if month > today.month:  # 미래 달이면 작년으로 간주
+        year -= 1
+    date = f"{year}-{month:02d}-{day:02d}"
+    return date, (s[:m.start()] + ' ' + s[m.end():])
+
 def parse_natural_language(text: str) -> dict:
-    text = text.strip()
     result = {"date": None, "store_name": None, "amount": None, "memo": ""}
+    work = text.strip()
 
-    amount_match = re.search(r'(\d+)\s*원?$', text)
-    if amount_match:
-        result["amount"] = int(amount_match.group(1))
-        text = text[:amount_match.start()].strip()
+    amount, work = _extract_amount(work)
+    if amount is not None:
+        result["amount"] = amount
 
-    date_match = re.search(r'(\d{1,2})[/-](\d{1,2})', text)
-    if date_match:
-        month, day = date_match.group(1), date_match.group(2)
-        today = datetime.now()
-        year = today.year
-        if int(month) > today.month:
-            year -= 1
-        result["date"] = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
-        text = text[:date_match.start()] + text[date_match.end():]
+    date, work = _extract_date(work)
+    if date:
+        result["date"] = date
 
-    store = text.strip()
+    store = work.strip(" ·-\t")
     if store:
         result["store_name"] = store
 
@@ -136,7 +166,6 @@ def parse_natural_language(text: str) -> dict:
         result["date"] = datetime.now().strftime("%Y-%m-%d")
 
     return result
-# ── ⚠️ 미사용 블록 끝 ──────────────────────────────────
 
 # ── 인증 ────────────────────────────────────────
 @app.post("/auth/check-username")
@@ -1333,20 +1362,26 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const n = chatCardSeq++;
         const id = 'cc' + n;
         pendingExpenses[n] = expense;
+        if ((!userCategories || userCategories.length === 0) && categories) userCategories = categories;
 
-        const opts = categories.map(c =>
-            '<option value="' + escapeHtml(c) + '"' + (c === expense.category ? ' selected' : '') + '>' + escapeHtml(c) + '</option>'
-        ).join('');
+        const labelStyle = 'display:block; font-size:11px; color:#666; margin:6px 0 2px;';
+        const inputStyle = 'width:100%; margin:0; padding:6px; font-size:13px;';
 
         messages.innerHTML +=
             '<div class="chat-message bot" id="' + id + '" style="text-align:left;">' +
-                '<div style="font-weight:600; margin-bottom:6px;">이렇게 저장할까요?</div>' +
-                '<div style="font-size:13px; line-height:1.7;">' +
-                    '📅 ' + escapeHtml(expense.date) + '<br>' +
-                    '🏪 ' + escapeHtml(expense.store) + '<br>' +
-                    '💰 ' + Number(expense.amount).toLocaleString() + '원' +
+                '<div style="font-weight:600; margin-bottom:4px;">이렇게 저장할까요? <span style="font-weight:400; color:#888; font-size:12px;">(수정 가능)</span></div>' +
+                '<label style="' + labelStyle + '">📅 날짜</label>' +
+                '<input type="date" id="' + id + '-date" value="' + escapeHtml(expense.date) + '" style="' + inputStyle + '" />' +
+                '<label style="' + labelStyle + '">🏪 가게</label>' +
+                '<input id="' + id + '-store" value="' + escapeHtml(expense.store) + '" style="' + inputStyle + '" />' +
+                '<label style="' + labelStyle + '">💰 금액</label>' +
+                '<input type="number" id="' + id + '-amount" value="' + Number(expense.amount) + '" style="' + inputStyle + '" />' +
+                '<label style="' + labelStyle + '">🏷️ 카테고리</label>' +
+                '<select id="' + id + '-cat" style="' + inputStyle + '">' + catOptions(expense.category) + '</select>' +
+                '<div style="display:flex; gap:5px; margin-top:5px;">' +
+                    '<input id="' + id + '-newcat" placeholder="새 카테고리 추가" style="flex:1; margin:0; padding:6px; font-size:12px;" />' +
+                    '<button onclick="addCatFromCard(' + n + ')" style="width:auto; margin:0; padding:6px 10px; font-size:12px; background:#4CAF50;">+</button>' +
                 '</div>' +
-                '<select id="' + id + '-cat" style="width:100%; margin:8px 0 0; padding:6px; font-size:13px;">' + opts + '</select>' +
                 '<div style="display:flex; gap:5px; margin-top:8px;">' +
                     '<button onclick="confirmSave(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px;">저장</button>' +
                     '<button onclick="cancelSave(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px; background:#999;">취소</button>' +
@@ -1355,17 +1390,46 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         messages.scrollTop = messages.scrollHeight;
     }
 
-    async function confirmSave(n) {
-        const expense = pendingExpenses[n];
-        if (!expense) return;
+    // 확인 카드 안에서 새 카테고리 추가
+    async function addCatFromCard(n) {
         const id = 'cc' + n;
-        const catSel = document.getElementById(id + '-cat');
-        const category = catSel ? catSel.value : expense.category;
+        const input = document.getElementById(id + '-newcat');
+        const name = input.value.trim();
+        if (!name) { showToast('카테고리명을 입력하세요', 'error'); return; }
 
         const form = new FormData();
-        form.append('date', expense.date);
-        form.append('store', expense.store);
-        form.append('amount', parseInt(expense.amount));
+        form.append('name', name);
+        try {
+            const res = await fetch('/api/categories/add', {method: 'POST', body: form});
+            const data = await res.json();
+            if (data.status === 'success') {
+                userCategories = data.categories;
+                updateSelectOptions(data.categories);  // 사이드바 드롭다운도 갱신
+                const sel = document.getElementById(id + '-cat');
+                if (sel) sel.innerHTML = catOptions(name);  // 이 카드 드롭다운 갱신 + 새 값 선택
+                input.value = '';
+                showToast('카테고리 추가됨', 'success');
+            } else {
+                showToast(data.error || '카테고리 추가 실패', 'error');
+            }
+        } catch (e) { showToast('카테고리 추가 중 오류', 'error'); }
+    }
+
+    async function confirmSave(n) {
+        if (!pendingExpenses[n]) return;
+        const id = 'cc' + n;
+        const date = document.getElementById(id + '-date').value;
+        const store = document.getElementById(id + '-store').value.trim();
+        const amount = document.getElementById(id + '-amount').value;
+        const category = document.getElementById(id + '-cat').value;
+
+        if (!date || !store || !amount) { showToast('날짜·가게·금액을 입력해주세요', 'error'); return; }
+        if (parseInt(amount) <= 0) { showToast('금액은 1원 이상이어야 합니다', 'error'); return; }
+
+        const form = new FormData();
+        form.append('date', date);
+        form.append('store', store);
+        form.append('amount', parseInt(amount));
         form.append('category', category);
 
         try {
@@ -1374,11 +1438,11 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             const card = document.getElementById(id);
             if (result.status === 'success') {
                 if (card) card.outerHTML = '<div class="chat-message bot">✅ 저장 완료: ' +
-                    escapeHtml(expense.date) + ' · ' + escapeHtml(expense.store) + ' · ' +
-                    Number(expense.amount).toLocaleString() + '원 · ' + escapeHtml(category) + '</div>';
+                    escapeHtml(date) + ' · ' + escapeHtml(store) + ' · ' +
+                    Number(amount).toLocaleString() + '원 · ' + escapeHtml(category) + '</div>';
                 delete pendingExpenses[n];
                 // 저장한 날짜의 달로 달력 갱신
-                const d = new Date(expense.date);
+                const d = new Date(date);
                 currentMonth = new Date(d.getFullYear(), d.getMonth(), 1);
                 loadExpensesAndRender();
             } else {
