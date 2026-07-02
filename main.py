@@ -338,6 +338,47 @@ async def get_analysis(period: str = "month", offset: int = 0, session: Optional
         "expenses": expenses
     }
 
+# ── 카테고리 자동분류 (무료 로컬: 과거 내역 학습 → 키워드 → 기본값) ──
+# 처음 보는 가게 대비 최소 키워드 힌트. 사용자 카테고리에 존재할 때만 매핑됨.
+CATEGORY_KEYWORD_HINTS = {
+    "카페": ["카페", "커피", "스타벅스", "스벅", "이디야", "투썸", "메가", "빽다방", "컴포즈", "coffee"],
+    "식사": ["식당", "김밥", "분식", "샐러디", "맥도날드", "버거", "롯데리아", "서브웨이", "국밥",
+             "치킨", "피자", "백반", "한식", "일식", "중식", "떡볶이", "배달", "food"],
+    "교통": ["택시", "버스", "지하철", "교통", "주유", "기차", "ktx", "카카오t"],
+    "쇼핑": ["마트", "쿠팡", "편의점", "gs25", "cu", "세븐일레븐", "이마트", "올리브영", "다이소"],
+}
+
+async def classify_expense(user: dict, store_name: str) -> str:
+    """가게명 → 사용자 카테고리 중 하나로 자동 분류.
+    ① 과거 내역에서 같은/유사 가게명의 최빈 카테고리 (개인화 학습)
+    ② 키워드 힌트 (사용자 카테고리에 존재할 때만)
+    ③ 기본값(첫 카테고리)"""
+    categories = user.get("categories", DEFAULT_CATEGORIES)
+    store = (store_name or "").strip()
+    if not store or not categories:
+        return categories[0] if categories else "기타"
+
+    # ① 과거 내역 조회 → 최빈 카테고리
+    counts = {}
+    async for doc in db.expenses.find({"user_id": user["_id"]}):
+        past_store = (doc.get("store_name") or "").strip()
+        cat = doc.get("category")
+        if not past_store or not cat or cat not in categories:
+            continue
+        if past_store == store or past_store in store or store in past_store:
+            counts[cat] = counts.get(cat, 0) + 1
+    if counts:
+        return max(counts, key=counts.get)
+
+    # ② 키워드 힌트
+    low = store.lower()
+    for cat, kws in CATEGORY_KEYWORD_HINTS.items():
+        if cat in categories and any(k in low for k in kws):
+            return cat
+
+    # ③ 기본값
+    return categories[0]
+
 # ── 챗봇 ──────────────────────────────────────────
 @app.post("/chat")
 async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
@@ -347,8 +388,28 @@ async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
 
     text = message.strip()
 
+    # 질문 키워드 (지출 조회) — 저장 의도와 구분
+    is_query = any(kw in text for kw in ["얼마", "지출", "썼", "쓴", "총", "합계"])
+
+    # 저장 의도: "6/30 샐러디 9900원" 처럼 금액+가게가 파싱되면 확인 카드 반환
+    if not is_query:
+        parsed = parse_natural_language(text)
+        if parsed["amount"] is not None and parsed["store_name"]:
+            category = await classify_expense(user, parsed["store_name"])
+            return {
+                "type": "confirm",
+                "expense": {
+                    "date": parsed["date"],
+                    "store": parsed["store_name"],
+                    "amount": parsed["amount"],
+                    "category": category,
+                },
+                "categories": user.get("categories", DEFAULT_CATEGORIES),
+                "response": f"이렇게 저장할까요?",
+            }
+
     # 지출/금액 관련 질문 처리
-    if any(kw in text for kw in ["얼마", "지출", "썼", "쓴", "총", "합계"]):
+    if is_query:
         # 기간 파악 (기본: 이번달)
         if any(w in text for w in ["지난달", "저번달", "전달"]):
             period, offset, when = "month", -1, "지난달"
@@ -375,9 +436,9 @@ async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
         total = sum(e.get("amount", 0) for e in expenses)
 
         cat_str = f" '{matched_cat}'" if matched_cat else ""
-        return {"response": f"{when}{cat_str} 지출: {total:,}원 ({len(expenses)}건)"}
+        return {"type": "message", "response": f"{when}{cat_str} 지출: {total:,}원 ({len(expenses)}건)"}
 
-    return {"response": "지출을 물어보세요. 예: \"이번달 얼마 썼어?\", \"지난달 카페 지출\", \"올해 총 지출\""}
+    return {"type": "message", "response": "지출을 물어보거나(\"이번달 얼마 썼어?\") 저장할 내역을 입력하세요(\"6/30 샐러디 9900원\")."}
 
 # HTML 페이지들
 LOGIN_PAGE = """<!DOCTYPE html>
@@ -777,10 +838,10 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             <h3>💬 챗봇</h3>
             <div class="chatbot">
                 <div class="chat-messages" id="messages">
-                    <div class="chat-message bot">안녕하세요! 지출에 대해 물어보세요.</div>
+                    <div class="chat-message bot">안녕하세요! 지출을 물어보거나("이번달 얼마 썼어?") 바로 입력해 저장할 수 있어요.<br>예: "6/30 샐러디 9900원"</div>
                 </div>
                 <div class="chat-input">
-                    <input type="text" id="chat-input" placeholder="메시지..." onkeypress="if(event.key=='Enter') sendChat()" />
+                    <input type="text" id="chat-input" placeholder="예: 6/30 샐러디 9900원" onkeypress="if(event.key=='Enter') sendChat()" />
                     <button onclick="sendChat()">→</button>
                 </div>
             </div>
@@ -1095,22 +1156,110 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         }
     }
 
+    let chatCardSeq = 0;
+    const pendingExpenses = {};
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
     async function sendChat() {
-        const input = document.getElementById('chat-input').value;
+        const inputEl = document.getElementById('chat-input');
+        const input = inputEl.value.trim();
         if (!input) return;
 
         const messages = document.getElementById('messages');
-        messages.innerHTML += '<div class="chat-message user">' + input + '</div>';
-        document.getElementById('chat-input').value = '';
-
-        const response = await fetch('/chat', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: 'message=' + encodeURIComponent(input)
-        });
-        const data = await response.json();
-        messages.innerHTML += '<div class="chat-message bot">' + data.response + '</div>';
+        messages.innerHTML += '<div class="chat-message user">' + escapeHtml(input) + '</div>';
+        inputEl.value = '';
         messages.scrollTop = messages.scrollHeight;
+
+        try {
+            const response = await fetch('/chat', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'message=' + encodeURIComponent(input)
+            });
+            const data = await response.json();
+
+            if (data.type === 'confirm' && data.expense) {
+                renderConfirmCard(data.expense, data.categories || []);
+            } else {
+                messages.innerHTML += '<div class="chat-message bot">' + (data.response || '') + '</div>';
+            }
+        } catch (e) {
+            messages.innerHTML += '<div class="chat-message bot">오류가 발생했어요. 다시 시도해주세요.</div>';
+        }
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    // 파싱 결과 확인 카드 (저장 전 사용자 확인/수정)
+    function renderConfirmCard(expense, categories) {
+        const messages = document.getElementById('messages');
+        const n = chatCardSeq++;
+        const id = 'cc' + n;
+        pendingExpenses[n] = expense;
+
+        const opts = categories.map(c =>
+            '<option value="' + escapeHtml(c) + '"' + (c === expense.category ? ' selected' : '') + '>' + escapeHtml(c) + '</option>'
+        ).join('');
+
+        messages.innerHTML +=
+            '<div class="chat-message bot" id="' + id + '" style="text-align:left;">' +
+                '<div style="font-weight:600; margin-bottom:6px;">이렇게 저장할까요?</div>' +
+                '<div style="font-size:13px; line-height:1.7;">' +
+                    '📅 ' + escapeHtml(expense.date) + '<br>' +
+                    '🏪 ' + escapeHtml(expense.store) + '<br>' +
+                    '💰 ' + Number(expense.amount).toLocaleString() + '원' +
+                '</div>' +
+                '<select id="' + id + '-cat" style="width:100%; margin:8px 0 0; padding:6px; font-size:13px;">' + opts + '</select>' +
+                '<div style="display:flex; gap:5px; margin-top:8px;">' +
+                    '<button onclick="confirmSave(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px;">저장</button>' +
+                    '<button onclick="cancelSave(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px; background:#999;">취소</button>' +
+                '</div>' +
+            '</div>';
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function confirmSave(n) {
+        const expense = pendingExpenses[n];
+        if (!expense) return;
+        const id = 'cc' + n;
+        const catSel = document.getElementById(id + '-cat');
+        const category = catSel ? catSel.value : expense.category;
+
+        const form = new FormData();
+        form.append('date', expense.date);
+        form.append('store', expense.store);
+        form.append('amount', parseInt(expense.amount));
+        form.append('category', category);
+
+        try {
+            const res = await fetch('/add/expense', {method: 'POST', body: form});
+            const result = await res.json();
+            const card = document.getElementById(id);
+            if (result.status === 'success') {
+                if (card) card.outerHTML = '<div class="chat-message bot">✅ 저장 완료: ' +
+                    escapeHtml(expense.date) + ' · ' + escapeHtml(expense.store) + ' · ' +
+                    Number(expense.amount).toLocaleString() + '원 · ' + escapeHtml(category) + '</div>';
+                delete pendingExpenses[n];
+                // 저장한 날짜의 달로 달력 갱신
+                const d = new Date(expense.date);
+                currentMonth = new Date(d.getFullYear(), d.getMonth(), 1);
+                loadExpensesAndRender();
+            } else {
+                showToast(result.error || '저장 실패', 'error');
+            }
+        } catch (e) {
+            showToast('저장 중 오류가 발생했습니다', 'error');
+        }
+        const messages = document.getElementById('messages');
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    function cancelSave(n) {
+        delete pendingExpenses[n];
+        const card = document.getElementById('cc' + n);
+        if (card) card.outerHTML = '<div class="chat-message bot">취소했어요.</div>';
     }
 
     async function logout() {
