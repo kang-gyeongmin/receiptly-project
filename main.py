@@ -12,6 +12,10 @@ import hashlib
 import secrets
 import ssl
 import certifi
+import json as _json
+import asyncio
+from urllib.parse import quote
+from urllib.request import urlopen
 from typing import Optional
 import easyocr
 import numpy as np
@@ -26,6 +30,9 @@ load_dotenv()
 app = FastAPI()
 client = AsyncIOMotorClient(os.getenv("MONGO_URI"))
 db = client[os.getenv("DB_NAME")]
+
+# ODsay 대중교통 API 키 (지하철 요금 조회). lab.odsay.com 에서 무료 발급 → .env 에 ODSAY_API_KEY
+ODSAY_API_KEY = os.getenv("ODSAY_API_KEY", "")
 
 # OCR 리더 초기화
 try:
@@ -520,6 +527,48 @@ async def classify_expense(user: dict, store_name: str) -> str:
     # ③ 기본값
     return categories[0]
 
+# ── 지하철 요금 조회 (ODsay API) ───────────────────────
+def _odsay_call(endpoint: str, params: dict) -> dict:
+    """ODsay API 동기 호출. urlopen은 블로킹이므로 asyncio.to_thread로 감싸 사용."""
+    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    query += f"&apiKey={quote(ODSAY_API_KEY)}"
+    url = f"https://api.odsay.com/v1/api/{endpoint}?{query}"
+    with urlopen(url, timeout=8) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+def _clean_station(name: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r'(까지|부터|으로|로|행)$', '', name)
+    return name.strip()
+
+async def odsay_station_coord(name: str):
+    """역 이름 → (x경도, y위도, 정식역명). 못 찾으면 '역' 붙여 재시도. 실패 시 None."""
+    for q in (name, name + "역") if not name.endswith("역") else (name,):
+        data = await asyncio.to_thread(_odsay_call, "searchStation", {"stationName": q})
+        stations = (data.get("result") or {}).get("station") or []
+        if stations:
+            s = stations[0]
+            return s.get("x"), s.get("y"), s.get("stationName", q)
+    return None
+
+async def odsay_subway_fare(start_name: str, end_name: str):
+    """두 역 사이 대중교통 요금 조회. {payment, time, start, end} 또는 None."""
+    s = await odsay_station_coord(_clean_station(start_name))
+    e = await odsay_station_coord(_clean_station(end_name))
+    if not s or not e:
+        return None
+    data = await asyncio.to_thread(
+        _odsay_call, "searchPubTransPathT",
+        {"SX": s[0], "SY": s[1], "EX": e[0], "EY": e[1]}
+    )
+    paths = (data.get("result") or {}).get("path") or []
+    if not paths:
+        return None
+    info = paths[0].get("info") or {}
+    if info.get("payment") is None:
+        return None
+    return {"payment": info["payment"], "time": info.get("totalTime"), "start": s[2], "end": e[2]}
+
 # ── 챗봇 ──────────────────────────────────────────
 @app.post("/chat")
 async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
@@ -528,6 +577,36 @@ async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
         return JSONResponse({"error": "로그인 필요"}, status_code=401)
 
     text = message.strip()
+
+    # 지하철 요금 조회: "지하철 ... A(에서/부터) B ... 얼마" → ODsay로 요금 조회 후 저장 확인 카드
+    if "지하철" in text:
+        m = re.search(r'([가-힣A-Za-z0-9]{2,})\s*(?:에서|부터|~|->|→)\s*([가-힣A-Za-z0-9]{2,})', text)
+        if not m:
+            m = re.search(r'([가-힣A-Za-z0-9]{2,}역)\s+([가-힣A-Za-z0-9]{2,}역)', text)
+        if m:
+            if not ODSAY_API_KEY:
+                return {"type": "message", "response": "지하철 요금 조회는 ODsay API 키가 필요해요. lab.odsay.com 에서 무료 발급 후 .env 에 ODSAY_API_KEY 로 넣어주세요."}
+            start_name, end_name = m.group(1), m.group(2)
+            try:
+                fare = await odsay_subway_fare(start_name, end_name)
+            except Exception as ex:
+                return {"type": "message", "response": f"요금 조회 중 오류가 발생했어요: {ex}"}
+            if not fare:
+                return {"type": "message", "response": f"'{start_name}'→'{end_name}' 경로를 찾지 못했어요. 역 이름을 확인해주세요."}
+            category = await classify_expense(user, "지하철 교통")
+            time_str = f" (약 {fare['time']}분)" if fare.get("time") else ""
+            return {
+                "type": "confirm",
+                "expense": {
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "store": f"지하철 {fare['start']}→{fare['end']}",
+                    "amount": fare["payment"],
+                    "category": category,
+                    "kind": "expense",
+                },
+                "categories": user.get("categories", DEFAULT_CATEGORIES),
+                "response": f"{fare['start']}→{fare['end']} 지하철 요금은 {fare['payment']:,}원이에요{time_str}. 저장할까요?",
+            }
 
     # 질문 키워드 (지출 조회) — 저장 의도와 구분
     is_query = any(kw in text for kw in ["얼마", "지출", "썼", "쓴", "총", "합계"])
@@ -583,7 +662,7 @@ async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
         cat_str = f" '{matched_cat}'" if matched_cat else ""
         return {"type": "message", "response": f"{when}{cat_str} 지출: {total:,}원 ({len(expenses)}건)"}
 
-    return {"type": "message", "response": "지출을 물어보거나(\"이번달 얼마 썼어?\") 저장할 내역을 입력하세요(\"6/30 샐러디 9900원\")."}
+    return {"type": "message", "response": "예: \"이번달 얼마 썼어?\" / \"6/30 샐러디 9900원\" / \"월급 300만원\" / \"지하철 강남역에서 홍대입구역 얼마?\""}
 
 @app.post("/chat/image")
 async def chat_image(file: UploadFile = File(...), session: Optional[str] = Cookie(None)):
@@ -1021,7 +1100,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             <h3>💬 챗봇</h3>
             <div class="chatbot">
                 <div class="chat-messages" id="messages">
-                    <div class="chat-message bot">안녕하세요! 지출을 물어보거나("이번달 얼마 썼어?") 바로 입력해 저장할 수 있어요.<br>예: "6/30 샐러디 9900원"</div>
+                    <div class="chat-message bot">안녕하세요! 이렇게 해보세요:<br>• 저장: "6/30 샐러디 9900원", "월급 300만원"<br>• 조회: "이번달 얼마 썼어?"<br>• 지하철 요금: "지하철 강남역에서 홍대입구역 얼마?"</div>
                 </div>
                 <div class="chat-input">
                     <input type="file" id="chat-image" accept="image/*" style="display:none;" onchange="sendChatImage(this)" />
