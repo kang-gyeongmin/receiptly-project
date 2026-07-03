@@ -227,6 +227,100 @@ def parse_natural_language(text: str) -> dict:
 
     return result
 
+# ── free-form 파서 (상대/다중 날짜 + 금액 위치 자유 + 카테고리 힌트) ──
+INCOME_KEYWORDS = ["입금", "월급", "급여", "용돈", "수입", "보너스", "상여", "이체받", "받음", "환급"]
+
+def _extract_all_dates(text: str):
+    """상대/절대 날짜를 여러 개 추출. 반환: ([YYYY-MM-DD...], 날짜 제거된 text)"""
+    today = datetime.now()
+    found = []
+    def add(dt):
+        s = dt.strftime("%Y-%m-%d")
+        if s not in found:
+            found.append(s)
+
+    # 상대 표현 (긴 단어 먼저 — 엊그제가 그제보다 앞)
+    rel = [("그끄저께", 3), ("그끄제", 3), ("엊그제", 2), ("그저께", 2), ("그제", 2),
+           ("어제", 1), ("오늘", 0), ("모레", -2), ("내일", -1)]
+    for word, ago in rel:
+        if word in text:
+            add(today - timedelta(days=ago))
+            text = text.replace(word, " ")
+
+    # N일 전
+    for m in re.finditer(r'(\d+)\s*일\s*전', text):
+        add(today - timedelta(days=int(m.group(1))))
+    text = re.sub(r'\d+\s*일\s*전', ' ', text)
+
+    # 절대: M월 D일 (여러 개)
+    for m in re.finditer(r'(\d{1,2})\s*월\s*(\d{1,2})\s*일?', text):
+        mo, d = int(m.group(1)), int(m.group(2))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            add(datetime(today.year - (1 if mo > today.month else 0), mo, d))
+    text = re.sub(r'(\d{1,2})\s*월\s*(\d{1,2})\s*일?', ' ', text)
+
+    # 절대: M/D, M-D (여러 개)
+    for m in re.finditer(r'(\d{1,2})[/-](\d{1,2})', text):
+        mo, d = int(m.group(1)), int(m.group(2))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            add(datetime(today.year - (1 if mo > today.month else 0), mo, d))
+    text = re.sub(r'(\d{1,2})[/-](\d{1,2})', ' ', text)
+
+    return found, text
+
+def _find_amount_anywhere(s: str):
+    """문장 어디서든 금액 추출(끝 고정 아님). 반환: (금액 or None, 금액 제거된 text)"""
+    patterns = [
+        (r'(\d+)\s*만\s*(\d+)\s*천\s*원?', lambda m: int(m.group(1)) * 10000 + int(m.group(2)) * 1000),
+        (r'(\d+)\s*만\s*원?',             lambda m: int(m.group(1)) * 10000),
+        (r'(\d+)\s*천\s*원?',             lambda m: int(m.group(1)) * 1000),
+        (r'([\d,]{2,})\s*원',             lambda m: int(m.group(1).replace(',', ''))),
+        (r'([\d,]{2,})',                  lambda m: int(m.group(1).replace(',', ''))),
+    ]
+    for pat, conv in patterns:
+        m = re.search(pat, s)
+        if m:
+            return conv(m), (s[:m.start()] + ' ' + s[m.end():])
+    return None, s
+
+_STORE_DROP = {
+    # 조사/접속
+    "랑", "이랑", "도", "과", "와", "그리고", "또", "좀", "에", "은", "는",
+    "이", "가", "을", "를", "의",
+    # 동사/명령
+    "넣어줘", "넣어", "넣어줘요", "기록", "기록해줘", "기록해", "저장", "저장해줘", "해줘",
+    "추가해줘", "추가", "썼어", "썼다", "샀어", "샀다", "냈어", "냈다", "썼", "샀",
+}
+
+def _clean_store(s: str) -> str:
+    toks = []
+    for t in re.split(r'\s+', s.strip()):
+        if not t or t in _STORE_DROP:
+            continue
+        t = re.sub(r'(으로|로|에서|에|을|를|이|가|은|는|도|랑)$', '', t)
+        if t and t not in _STORE_DROP:
+            toks.append(t)
+    return " ".join(toks).strip()
+
+def parse_free_expense(text: str) -> dict:
+    """자유 문장 → {dates:[...], amount, store, category, kind}. 여러 날짜면 dates 다수."""
+    work = text.strip()
+    dates, work = _extract_all_dates(work)
+    amount, work = _find_amount_anywhere(work)
+
+    # 카테고리 힌트
+    category = None
+    if re.search(r'교통|지하철|버스|택시', text):
+        category = "교통"
+
+    kind = "income" if any(k in text for k in INCOME_KEYWORDS) else "expense"
+    store = _clean_store(work)
+
+    if amount is not None and not dates:
+        dates = [datetime.now().strftime("%Y-%m-%d")]
+
+    return {"dates": dates, "amount": amount, "store": store, "category": category, "kind": kind}
+
 # ── 인증 ────────────────────────────────────────
 @app.post("/auth/check-username")
 async def check_username(username: str = Form(...)):
@@ -608,31 +702,26 @@ async def chat(message: str = Form(...), session: Optional[str] = Cookie(None)):
                 "response": f"{fare['start']}→{fare['end']} 지하철 요금은 {fare['payment']:,}원이에요{time_str}. 저장할까요?",
             }
 
-    # 질문 키워드 (지출 조회) — 저장 의도와 구분
-    is_query = any(kw in text for kw in ["얼마", "지출", "썼", "쓴", "총", "합계"])
-
-    # 저장 의도: "6/30 샐러디 9900원" 처럼 금액+가게가 파싱되면 확인 카드 반환
-    if not is_query:
-        parsed = parse_natural_language(text)
-        if parsed["amount"] is not None and parsed["store_name"]:
-            # 수입 키워드가 있으면 income으로 판단
-            income_kws = ["입금", "월급", "급여", "용돈", "수입", "보너스", "상여", "이체받", "받음", "환급"]
-            kind = "income" if any(k in text for k in income_kws) else "expense"
-            category = await classify_expense(user, parsed["store_name"])
-            return {
-                "type": "confirm",
-                "expense": {
-                    "date": parsed["date"],
-                    "store": parsed["store_name"],
-                    "amount": parsed["amount"],
-                    "category": category,
-                    "kind": kind,
-                },
-                "categories": user.get("categories", DEFAULT_CATEGORIES),
-                "response": f"이렇게 저장할까요?",
-            }
+    # 저장 의도 우선: 금액+가게(또는 카테고리)가 있고 "얼마/?"가 없으면 저장으로 판단
+    # ("택시 12000원 썼어"처럼 '썼'이 있어도 금액+가게면 저장)
+    fx = parse_free_expense(text)
+    is_save = (fx["amount"] is not None and (fx["store"] or fx["category"])
+               and "얼마" not in text and "?" not in text)
+    if is_save:
+        cats = user.get("categories", DEFAULT_CATEGORIES)
+        category = fx["category"] if fx["category"] else await classify_expense(user, fx["store"])
+        base = {"store": fx["store"], "amount": fx["amount"], "category": category, "kind": fx["kind"]}
+        if len(fx["dates"]) <= 1:
+            date = fx["dates"][0] if fx["dates"] else datetime.now().strftime("%Y-%m-%d")
+            return {"type": "confirm", "expense": {"date": date, **base},
+                    "categories": cats, "response": "이렇게 저장할까요?"}
+        dates = sorted(fx["dates"])
+        pretty = ", ".join(d[5:].replace("-", "/") for d in dates)
+        return {"type": "confirm_multi", "dates": dates, "expense": base,
+                "categories": cats, "response": f"{len(dates)}건({pretty})을 저장할까요?"}
 
     # 지출/금액 관련 질문 처리
+    is_query = any(kw in text for kw in ["얼마", "지출", "썼", "쓴", "총", "합계"])
     if is_query:
         # 기간 파악 (기본: 이번달)
         if any(w in text for w in ["지난달", "저번달", "전달"]):
@@ -1305,7 +1394,9 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     }
 
     function catOptions(selected) {
-        return userCategories.map(c =>
+        let cats = userCategories.slice();
+        if (selected && cats.indexOf(selected) === -1) cats = [selected].concat(cats);  // 목록에 없는 값(예: 교통)도 선택지로
+        return cats.map(c =>
             '<option value="' + escapeHtml(c) + '"' + (c === selected ? ' selected' : '') + '>' + escapeHtml(c) + '</option>'
         ).join('');
     }
@@ -1544,9 +1635,18 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
     let chatCardSeq = 0;
     const pendingExpenses = {};
+    let lastPending = null;  // {type:'single'|'multi', n} — 답장으로 저장/취소 처리용
 
     function escapeHtml(s) {
         return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function isAffirmative(s) {
+        if (/(취소|아니|아냐|ㄴㄴ|안 *해|하지 *마)/.test(s)) return false;
+        return /저장|기록|응|네|넵|예|그래|좋아|어어|ㅇㅇ|ㅇㅋ|오케이|콜|ok|okay|yes/i.test(s) || /^(ㅇ+|응+|어+)$/.test(s);
+    }
+    function isNegative(s) {
+        return /(취소|아니|아냐|ㄴㄴ|안 *해|하지 *마|안돼|그만)/.test(s);
     }
 
     async function sendChat() {
@@ -1559,6 +1659,22 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         inputEl.value = '';
         messages.scrollTop = messages.scrollHeight;
 
+        // 확인 카드가 떠 있으면 "응/저장/네" → 저장, "아니/취소" → 취소
+        if (lastPending) {
+            const p = lastPending;
+            if (isNegative(input)) {
+                lastPending = null;
+                if (p.type === 'multi') cancelMulti(p.n); else cancelSave(p.n);
+                return;
+            }
+            if (isAffirmative(input)) {
+                lastPending = null;
+                if (p.type === 'multi') await confirmSaveMulti(p.n); else await confirmSave(p.n);
+                return;
+            }
+        }
+        messages.scrollTop = messages.scrollHeight;
+
         try {
             const response = await fetch('/chat', {
                 method: 'POST',
@@ -1569,6 +1685,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
             if (data.type === 'confirm' && data.expense) {
                 renderConfirmCard(data.expense, data.categories || []);
+            } else if (data.type === 'confirm_multi' && data.expense) {
+                renderConfirmMultiCard(data, data.categories || []);
             } else {
                 messages.innerHTML += '<div class="chat-message bot">' + (data.response || '') + '</div>';
             }
@@ -1618,6 +1736,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const n = chatCardSeq++;
         const id = 'cc' + n;
         pendingExpenses[n] = expense;
+        lastPending = {type: 'single', n: n};
         if ((!userCategories || userCategories.length === 0) && categories) userCategories = categories;
 
         const labelStyle = 'display:block; font-size:11px; color:#666; margin:6px 0 2px;';
@@ -1647,6 +1766,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                     '<button onclick="confirmSave(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px;">저장</button>' +
                     '<button onclick="cancelSave(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px; background:#999;">취소</button>' +
                 '</div>' +
+                '<div style="font-size:11px; color:#aaa; margin-top:4px; text-align:center;">"응" / "취소" 라고 답해도 돼요</div>' +
             '</div>';
         messages.scrollTop = messages.scrollHeight;
     }
@@ -1678,6 +1798,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
     async function confirmSave(n) {
         if (!pendingExpenses[n]) return;
+        if (lastPending && lastPending.n === n) lastPending = null;
         const id = 'cc' + n;
         const date = document.getElementById(id + '-date').value;
         const store = document.getElementById(id + '-store').value.trim();
@@ -1721,7 +1842,92 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
     function cancelSave(n) {
         delete pendingExpenses[n];
+        if (lastPending && lastPending.n === n) lastPending = null;
         const card = document.getElementById('cc' + n);
+        if (card) card.outerHTML = '<div class="chat-message bot">취소했어요.</div>';
+    }
+
+    // 여러 날짜 한번에 저장하는 확인 카드
+    const pendingMulti = {};
+    function renderConfirmMultiCard(data, categories) {
+        const messages = document.getElementById('messages');
+        const n = chatCardSeq++;
+        const id = 'cm' + n;
+        pendingMulti[n] = data.dates;
+        lastPending = {type: 'multi', n: n};
+        if ((!userCategories || userCategories.length === 0) && categories) userCategories = categories;
+        const e = data.expense;
+        const labelStyle = 'display:block; font-size:11px; color:#666; margin:6px 0 2px;';
+        const inputStyle = 'width:100%; margin:0; padding:6px; font-size:13px;';
+        const datesPretty = data.dates.map(d => d.slice(5).replace('-', '/')).join(', ');
+
+        messages.innerHTML +=
+            '<div class="chat-message bot" id="' + id + '" style="text-align:left;">' +
+                '<div style="font-weight:600; margin-bottom:4px;">' + data.dates.length + '개 날짜에 저장할까요? <span style="font-weight:400; color:#888; font-size:12px;">(수정 가능)</span></div>' +
+                '<div style="font-size:12px; color:#555; margin-bottom:4px;">📅 ' + datesPretty + '</div>' +
+                '<label style="' + labelStyle + '">📂 종류</label>' +
+                '<select id="' + id + '-kind" style="' + inputStyle + '">' +
+                    '<option value="expense"' + (e.kind === 'income' ? '' : ' selected') + '>지출</option>' +
+                    '<option value="income"' + (e.kind === 'income' ? ' selected' : '') + '>수입</option>' +
+                '</select>' +
+                '<label style="' + labelStyle + '">🏪 가게/내용</label>' +
+                '<input id="' + id + '-store" value="' + escapeHtml(e.store) + '" style="' + inputStyle + '" />' +
+                '<label style="' + labelStyle + '">💰 금액 (각 날짜마다)</label>' +
+                '<input type="number" id="' + id + '-amount" value="' + Number(e.amount) + '" style="' + inputStyle + '" />' +
+                '<label style="' + labelStyle + '">🏷️ 카테고리</label>' +
+                '<select id="' + id + '-cat" style="' + inputStyle + '">' + catOptions(e.category) + '</select>' +
+                '<div style="display:flex; gap:5px; margin-top:8px;">' +
+                    '<button onclick="confirmSaveMulti(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px;">' + data.dates.length + '건 저장</button>' +
+                    '<button onclick="cancelMulti(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px; background:#999;">취소</button>' +
+                '</div>' +
+                '<div style="font-size:11px; color:#aaa; margin-top:4px; text-align:center;">"응" / "취소" 라고 답해도 돼요</div>' +
+            '</div>';
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function confirmSaveMulti(n) {
+        const dates = pendingMulti[n];
+        if (!dates) return;
+        if (lastPending && lastPending.n === n) lastPending = null;
+        const id = 'cm' + n;
+        const store = document.getElementById(id + '-store').value.trim();
+        const amount = document.getElementById(id + '-amount').value;
+        const category = document.getElementById(id + '-cat').value;
+        const kind = document.getElementById(id + '-kind').value;
+        if (!store || !amount) { showToast('가게/내용과 금액을 입력해주세요', 'error'); return; }
+        if (parseInt(amount) <= 0) { showToast('금액은 1원 이상이어야 합니다', 'error'); return; }
+
+        let ok = 0;
+        for (const date of dates) {
+            const form = new FormData();
+            form.append('date', date);
+            form.append('store', store);
+            form.append('amount', parseInt(amount));
+            form.append('category', category);
+            form.append('kind', kind);
+            try {
+                const res = await fetch('/add/expense', {method: 'POST', body: form});
+                const result = await res.json();
+                if (result.status === 'success') ok++;
+            } catch (e) { /* 계속 */ }
+        }
+        const card = document.getElementById(id);
+        if (card) card.outerHTML = '<div class="chat-message bot">✅ ' + ok + '건 저장 완료: ' +
+            escapeHtml(store) + ' · ' + Number(amount).toLocaleString() + '원 (' +
+            (kind === 'income' ? '수입' : escapeHtml(category)) + ')</div>';
+        delete pendingMulti[n];
+        if (dates.length) {
+            const d = new Date(dates[dates.length - 1]);
+            currentMonth = new Date(d.getFullYear(), d.getMonth(), 1);
+            loadExpensesAndRender();
+        }
+        document.getElementById('messages').scrollTop = 1e9;
+    }
+
+    function cancelMulti(n) {
+        delete pendingMulti[n];
+        if (lastPending && lastPending.n === n) lastPending = null;
+        const card = document.getElementById('cm' + n);
         if (card) card.outerHTML = '<div class="chat-message bot">취소했어요.</div>';
     }
 
