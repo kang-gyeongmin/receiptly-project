@@ -15,7 +15,7 @@ import certifi
 import json as _json
 import asyncio
 from urllib.parse import quote
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 from typing import Optional
 import easyocr
 import numpy as np
@@ -33,6 +33,10 @@ db = client[os.getenv("DB_NAME")]
 
 # ODsay 대중교통 API 키 (지하철 요금 조회). lab.odsay.com 에서 무료 발급 → .env 에 ODSAY_API_KEY
 ODSAY_API_KEY = os.getenv("ODSAY_API_KEY", "")
+
+# 네이버 쇼핑 검색 API (위시리스트 제품 검색). developers.naver.com 에서 무료 발급
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
 # OCR 리더 초기화
 try:
@@ -1095,6 +1099,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             <div class="tabs">
                 <button class="tab active" onclick="switchTab('calendar')">📅 달력</button>
                 <button class="tab" onclick="switchTab('analysis')">📊 분석</button>
+                <button class="tab" onclick="switchTab('wishlist')">🛍️ 위시리스트</button>
             </div>
 
             <!-- 달력 탭 -->
@@ -1160,6 +1165,31 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                         <tr><td colspan="4" style="text-align: center; color: #999;">지출 내역이 없습니다</td></tr>
                     </tbody>
                 </table>
+            </div>
+
+            <!-- 위시리스트 탭 -->
+            <div id="wishlist" class="tab-content">
+                <div style="background:#f9f9f9; padding:15px; border-radius:8px; margin-bottom:20px;">
+                    <h4 style="margin-bottom:10px;">🛍️ 위시리스트 추가</h4>
+                    <div style="display:flex; gap:8px;">
+                        <input type="text" id="wl-search" placeholder="제품명으로 검색 (예: 에어팟 프로)" style="margin:0; padding:10px; flex:1;" onkeypress="if(event.key=='Enter') searchWishlist()" />
+                        <button onclick="searchWishlist()" style="margin:0; padding:10px; width:auto;">🔍 검색</button>
+                    </div>
+                    <div id="wl-results" style="margin-top:10px;"></div>
+
+                    <div style="border-top:1px dashed #ddd; margin-top:12px; padding-top:12px;">
+                        <input type="text" id="wl-name" placeholder="제품명" style="margin:0 0 8px; padding:10px;" />
+                        <div style="display:flex; gap:8px;">
+                            <input type="number" id="wl-price" placeholder="가격" style="margin:0; padding:10px; flex:1;" />
+                            <input type="text" id="wl-image" placeholder="이미지 URL" style="margin:0; padding:10px; flex:2;" />
+                        </div>
+                        <input type="hidden" id="wl-url" />
+                        <button onclick="addWishlist()" style="margin-top:8px; padding:10px;">추가</button>
+                        <div style="font-size:11px; color:#999; margin-top:6px;">검색 결과를 클릭하면 제품명·가격·이미지가 아래에 채워져요. 직접 수정 후 추가할 수도 있어요.</div>
+                    </div>
+                </div>
+                <div style="font-size:12px; color:#aaa; margin-bottom:8px;">↕️ 항목을 끌어서 순서를 바꿀 수 있어요</div>
+                <div id="wishlist-list"></div>
             </div>
         </div>
 
@@ -1281,8 +1311,156 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
         document.getElementById(tab).classList.add('active');
         event.target.classList.add('active');
+        // 위시리스트 탭에선 사이드바(지출 입력+챗봇) 숨기고 전체폭 사용
+        const sidebar = document.querySelector('.sidebar');
+        const container = document.querySelector('.container');
+        if (tab === 'wishlist') {
+            if (sidebar) sidebar.style.display = 'none';
+            if (container) container.style.gridTemplateColumns = '1fr';
+        } else {
+            if (sidebar) sidebar.style.display = '';
+            if (container) container.style.gridTemplateColumns = '';
+        }
+
         if (tab === 'calendar') renderCalendar();
+        else if (tab === 'wishlist') loadWishlist();
         else loadAnalysis();
+    }
+
+    // ── 위시리스트 ──
+    let wishlistItems = [];
+    let wlDragIndex = null;
+    let wlSearchResults = [];
+
+    async function searchWishlist() {
+        const q = document.getElementById('wl-search').value.trim();
+        if (!q) return;
+        const box = document.getElementById('wl-results');
+        box.innerHTML = '<div style="color:#999; font-size:13px;">검색 중...</div>';
+        try {
+            const res = await fetch('/api/wishlist/search?q=' + encodeURIComponent(q));
+            const data = await res.json();
+            if (!res.ok) { box.innerHTML = '<div style="color:#f44336; font-size:12px;">' + (data.error || '검색 실패') + '</div>'; return; }
+            wlSearchResults = data.items || [];
+            if (wlSearchResults.length === 0) { box.innerHTML = '<div style="color:#999; font-size:13px;">검색 결과가 없어요.</div>'; return; }
+            box.innerHTML = wlSearchResults.map((r, i) =>
+                '<div onclick="selectWlResult(' + i + ')" style="display:flex; align-items:center; gap:8px; padding:6px; border:1px solid #eee; border-radius:6px; margin-bottom:5px; cursor:pointer; background:white;">' +
+                    (r.image ? '<img src="' + escapeHtml(r.image) + '" style="width:40px; height:40px; object-fit:cover; border-radius:4px; flex-shrink:0;" onerror="this.remove()" />' : '') +
+                    '<div style="flex:1; min-width:0;">' +
+                        '<div style="font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(r.title) + '</div>' +
+                        '<div style="font-size:12px; color:#4A90D9; font-weight:600;">' + Number(r.price).toLocaleString() + '원 <span style="color:#aaa; font-weight:400;">' + escapeHtml(r.mall) + '</span></div>' +
+                    '</div>' +
+                '</div>'
+            ).join('');
+        } catch (e) { box.innerHTML = '<div style="color:#f44336; font-size:12px;">검색 중 오류가 발생했어요</div>'; }
+    }
+
+    function selectWlResult(i) {
+        const r = wlSearchResults[i];
+        if (!r) return;
+        document.getElementById('wl-name').value = r.title;
+        document.getElementById('wl-price').value = r.price;
+        document.getElementById('wl-image').value = r.image || '';
+        // 네이버 상품 링크는 외부에서 열면 차단되므로 저장 안 함 → 백엔드가 쿠팡 검색 URL 생성
+        document.getElementById('wl-url').value = '';
+        showToast('아래에 채웠어요. 확인 후 추가하세요', 'success');
+    }
+
+    async function loadWishlist() {
+        try {
+            const res = await fetch('/api/wishlist');
+            const data = await res.json();
+            wishlistItems = data.items || [];
+            renderWishlist();
+        } catch (e) {
+            console.error('위시리스트 로드 오류:', e);
+        }
+    }
+
+    function renderWishlist() {
+        const box = document.getElementById('wishlist-list');
+        if (wishlistItems.length === 0) {
+            box.innerHTML = '<div style="text-align:center; color:#999; padding:30px;">위시리스트가 비어있어요. 위에서 추가해보세요!</div>';
+            return;
+        }
+        box.innerHTML = wishlistItems.map((it, i) => {
+            const img = it.image_url
+                ? '<img src="' + escapeHtml(it.image_url) + '" style="width:56px; height:56px; object-fit:cover; border-radius:6px; flex-shrink:0;" onerror="this.remove()" />'
+                : '<div style="width:56px; height:56px; background:#eee; border-radius:6px; display:flex; align-items:center; justify-content:center; font-size:20px; flex-shrink:0;">🛍️</div>';
+            // 네이버 상품 링크는 외부 접속이 차단되므로, 쿠팡 검색 링크로 대체(기존 항목 포함)
+            let u = it.url || '';
+            if (!u || u.indexOf('naver') !== -1) u = 'https://www.coupang.com/np/search?q=' + encodeURIComponent(it.name);
+            const label = u.indexOf('coupang') !== -1 ? '쿠팡' : '링크';
+            return '<div class="wl-item" data-i="' + i + '" ' +
+                'ondragover="event.preventDefault()" ondrop="wlDrop(' + i + ')" ' +
+                'style="display:flex; align-items:center; gap:12px; padding:10px; background:white; border:1px solid #eee; border-radius:8px; margin-bottom:8px;">' +
+                '<span draggable="true" ondragstart="wlDragStart(' + i + ')" title="드래그해서 순서 변경" style="color:#bbb; cursor:grab; padding:0 4px; font-size:18px;">⠿</span>' +
+                img +
+                '<div style="flex:1; min-width:0;">' +
+                    '<div style="font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(it.name) + '</div>' +
+                    '<div style="color:#4A90D9; font-weight:600;">' + Number(it.price).toLocaleString() + '원</div>' +
+                '</div>' +
+                '<a href="' + escapeHtml(u) + '" target="_blank" rel="noopener" style="text-decoration:none; background:#03C75A; color:white; padding:6px 10px; border-radius:6px; font-size:12px; white-space:nowrap;">' + label + ' 🔗</a>' +
+                '<button onclick="deleteWishlist(' + i + ')" style="width:auto; margin:0; padding:6px 10px; font-size:12px; background:#f44336;">삭제</button>' +
+            '</div>';
+        }).join('');
+    }
+
+    async function addWishlist() {
+        const name = document.getElementById('wl-name').value.trim();
+        const price = document.getElementById('wl-price').value;
+        const image = document.getElementById('wl-image').value.trim();
+        const url = document.getElementById('wl-url').value.trim();
+        if (!name || price === '') { showToast('제품명과 가격을 입력해주세요', 'error'); return; }
+
+        const form = new FormData();
+        form.append('name', name);
+        form.append('price', parseInt(price));
+        form.append('image_url', image);
+        form.append('url', url);
+        try {
+            const res = await fetch('/api/wishlist/add', {method: 'POST', body: form});
+            const data = await res.json();
+            if (data.status === 'success') {
+                document.getElementById('wl-name').value = '';
+                document.getElementById('wl-price').value = '';
+                document.getElementById('wl-image').value = '';
+                document.getElementById('wl-url').value = '';
+                document.getElementById('wl-search').value = '';
+                document.getElementById('wl-results').innerHTML = '';
+                showToast('추가 완료', 'success');
+                loadWishlist();
+            } else {
+                showToast(data.error || '추가 실패', 'error');
+            }
+        } catch (e) { showToast('추가 중 오류가 발생했습니다', 'error'); }
+    }
+
+    async function deleteWishlist(i) {
+        const it = wishlistItems[i];
+        if (!it) return;
+        const form = new FormData();
+        form.append('id', it._id);
+        try {
+            const res = await fetch('/api/wishlist/delete', {method: 'POST', body: form});
+            const data = await res.json();
+            if (data.status === 'success') { showToast('삭제 완료', 'success'); loadWishlist(); }
+            else showToast(data.error || '삭제 실패', 'error');
+        } catch (e) { showToast('삭제 중 오류가 발생했습니다', 'error'); }
+    }
+
+    function wlDragStart(i) { wlDragIndex = i; }
+    async function wlDrop(i) {
+        if (wlDragIndex === null || wlDragIndex === i) return;
+        const moved = wishlistItems.splice(wlDragIndex, 1)[0];
+        wishlistItems.splice(i, 0, moved);
+        wlDragIndex = null;
+        renderWishlist();  // 즉시 반영
+        // 서버에 새 순서 저장
+        const form = new FormData();
+        form.append('ids', JSON.stringify(wishlistItems.map(it => it._id)));
+        try { await fetch('/api/wishlist/reorder', {method: 'POST', body: form}); }
+        catch (e) { showToast('순서 저장 실패', 'error'); }
     }
 
     function prevMonth() {
@@ -2170,6 +2348,134 @@ async def rename_category(old_name: str = Form(...), new_name: str = Form(...), 
         {"$set": {"categories": categories}}
     )
     return {"status": "success", "categories": categories}
+
+# ── 위시리스트 API ─────────────────────────────────
+def _coupang_search_url(name: str) -> str:
+    return "https://www.coupang.com/np/search?q=" + quote(name)
+
+def _naver_shop_search(query: str, display: int = 6):
+    """네이버 쇼핑 검색 → [{title, price, image, link, mall}]. 자격증명 없으면 예외."""
+    url = "https://openapi.naver.com/v1/search/shop.json?query=" + quote(query) + f"&display={display}&sort=sim"
+    req = Request(url, headers={
+        "X-Naver-Client-Id": NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+    })
+    with urlopen(req, timeout=8) as resp:
+        data = _json.loads(resp.read().decode("utf-8"))
+    items = []
+    for it in data.get("items", []):
+        title = re.sub(r"<[^>]+>", "", it.get("title", "")).strip()  # <b> 태그 제거
+        try:
+            price = int(it.get("lprice", 0))
+        except (ValueError, TypeError):
+            price = 0
+        items.append({
+            "title": title,
+            "price": price,
+            "image": it.get("image", ""),
+            "link": it.get("link", ""),
+            "mall": it.get("mallName", ""),
+        })
+    return items
+
+@app.get("/api/wishlist/search")
+async def search_wishlist(q: str, session: Optional[str] = Cookie(None)):
+    """제품명으로 네이버 쇼핑 검색 → 가격/이미지/링크 후보 반환"""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return JSONResponse({"error": "네이버 검색 API 키가 필요해요. developers.naver.com 에서 발급 후 .env 에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 를 넣어주세요."}, status_code=400)
+    q = (q or "").strip()
+    if not q:
+        return {"items": []}
+    try:
+        items = await asyncio.to_thread(_naver_shop_search, q)
+    except Exception as ex:
+        return JSONResponse({"error": f"검색 중 오류가 발생했어요: {ex}"}, status_code=502)
+    return {"items": items}
+
+@app.get("/api/wishlist")
+async def get_wishlist(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    items = []
+    async for doc in db.wishlist.find({"user_id": user["_id"]}).sort("order", 1):
+        doc["_id"] = str(doc["_id"])
+        doc.pop("user_id", None)
+        items.append(doc)
+    return {"items": items}
+
+@app.post("/api/wishlist/add")
+async def add_wishlist(
+    name: str = Form(...),
+    price: int = Form(...),
+    image_url: str = Form(""),
+    url: str = Form(""),
+    session: Optional[str] = Cookie(None),
+):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    name = name.strip()
+    if not name:
+        return JSONResponse({"error": "제품명을 입력해주세요"}, status_code=400)
+    if price < 0:
+        return JSONResponse({"error": "가격이 올바르지 않습니다"}, status_code=400)
+
+    # 맨 뒤에 추가 (order = 현재 최대 + 1)
+    last = await db.wishlist.find_one({"user_id": user["_id"]}, sort=[("order", -1)])
+    order = (last["order"] + 1) if last and "order" in last else 0
+
+    doc = {
+        "user_id": user["_id"],
+        "name": name,
+        "price": price,
+        "url": url.strip() or _coupang_search_url(name),  # 검색 선택 링크 있으면 사용, 없으면 쿠팡 검색
+        "image_url": image_url.strip(),
+        "order": order,
+        "created_at": datetime.now().isoformat(),
+    }
+    result = await db.wishlist.insert_one(doc)
+    doc["_id"] = str(result.inserted_id)
+    doc.pop("user_id", None)
+    return {"status": "success", "item": doc}
+
+@app.post("/api/wishlist/delete")
+async def delete_wishlist(id: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    try:
+        oid = ObjectId(id)
+    except InvalidId:
+        return JSONResponse({"error": "잘못된 id입니다"}, status_code=400)
+    result = await db.wishlist.delete_one({"_id": oid, "user_id": user["_id"]})
+    if result.deleted_count == 0:
+        return JSONResponse({"error": "항목을 찾을 수 없습니다"}, status_code=404)
+    return {"status": "success"}
+
+@app.post("/api/wishlist/reorder")
+async def reorder_wishlist(ids: str = Form(...), session: Optional[str] = Cookie(None)):
+    """ids: 새 순서의 id 배열(JSON 문자열). 각 항목 order를 인덱스로 갱신."""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    try:
+        id_list = _json.loads(ids)
+    except Exception:
+        return JSONResponse({"error": "잘못된 순서 데이터"}, status_code=400)
+    for idx, sid in enumerate(id_list):
+        try:
+            oid = ObjectId(sid)
+        except InvalidId:
+            continue
+        await db.wishlist.update_one(
+            {"_id": oid, "user_id": user["_id"]},
+            {"$set": {"order": idx}},
+        )
+    return {"status": "success"}
 
 if __name__ == "__main__":
     import uvicorn
