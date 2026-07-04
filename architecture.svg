@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="760" viewBox="0 0 980 760" font-family="-apple-system, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#555"/>
+    </marker>
+    <style>
+      .title { font-size: 24px; font-weight: 700; fill: #222; }
+      .box-title { font-size: 15px; font-weight: 700; }
+      .sub { font-size: 12px; fill: #444; }
+      .small { font-size: 11px; fill: #666; }
+      .lbl { font-size: 12px; fill: #333; }
+      .edge { stroke: #555; stroke-width: 2; fill: none; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="980" height="760" fill="#f7f8fa"/>
+  <text x="40" y="46" class="title">🧾 Receiptly — 현재 아키텍처 (로컬)</text>
+
+  <!-- 사용자 기기 -->
+  <rect x="330" y="70" width="320" height="86" rx="12" fill="#E8F1FC" stroke="#4A90D9" stroke-width="2"/>
+  <text x="490" y="100" text-anchor="middle" class="box-title" fill="#2C5C8F">📱 사용자 기기 (브라우저)</text>
+  <text x="490" y="124" text-anchor="middle" class="sub">단일 HTML + JS 페이지</text>
+  <text x="490" y="142" text-anchor="middle" class="small">달력 · 분석 · 위시리스트 · 챗봇</text>
+
+  <!-- arrow browser <-> server -->
+  <path class="edge" d="M490,156 L490,206" marker-end="url(#arrow)"/>
+  <path class="edge" d="M470,206 L470,156" marker-end="url(#arrow)"/>
+  <text x="500" y="186" class="lbl">HTTP · 세션 쿠키(httponly)</text>
+
+  <!-- FastAPI 서버 -->
+  <rect x="150" y="210" width="680" height="220" rx="12" fill="#FFFFFF" stroke="#333" stroke-width="2"/>
+  <text x="176" y="238" class="box-title" fill="#222">⚙️ FastAPI 서버  (main.py · uvicorn :8000)</text>
+
+  <!-- 라우트 -->
+  <rect x="176" y="252" width="300" height="158" rx="8" fill="#F3F6F9" stroke="#bbb"/>
+  <text x="190" y="274" class="sub" font-weight="700">엔드포인트</text>
+  <text x="190" y="296" class="small">/ , /auth/*  (로그인·세션)</text>
+  <text x="190" y="315" class="small">/add/expense · /api/expenses</text>
+  <text x="190" y="334" class="small">/api/analysis · /api/categories</text>
+  <text x="190" y="353" class="small">/api/wishlist/* (검색·추가·순서)</text>
+  <text x="190" y="372" class="small">/chat (자연어·요금) · /chat/image</text>
+  <text x="190" y="393" class="small">HTML/JS 페이지를 문자열로 내장</text>
+
+  <!-- EasyOCR -->
+  <rect x="500" y="252" width="150" height="70" rx="8" fill="#FFF3E0" stroke="#E8A33D"/>
+  <text x="575" y="282" text-anchor="middle" class="sub" font-weight="700">🔍 EasyOCR</text>
+  <text x="575" y="302" text-anchor="middle" class="small">영수증 이미지 인식</text>
+
+  <!-- 파싱/분류 -->
+  <rect x="668" y="252" width="146" height="70" rx="8" fill="#EAF7EE" stroke="#4CAF50"/>
+  <text x="741" y="282" text-anchor="middle" class="sub" font-weight="700">🧠 파싱·분류</text>
+  <text x="741" y="302" text-anchor="middle" class="small">정규식 + 과거학습</text>
+
+  <text x="500" y="352" class="small">· 인증: 세션 쿠키 (비밀번호 sha256 — 개선 필요)</text>
+  <text x="500" y="372" class="small">· 소유권 검증: 본인 데이터만 접근</text>
+  <text x="500" y="392" class="small">· API 키는 .env (서버에만, 미노출)</text>
+
+  <!-- MongoDB -->
+  <rect x="150" y="500" width="360" height="180" rx="12" fill="#E9F7EF" stroke="#2E9E5B" stroke-width="2"/>
+  <text x="176" y="528" class="box-title" fill="#1E7A44">🗄️ MongoDB  (Docker :27017, 볼륨 mongo_data)</text>
+  <rect x="176" y="544" width="150" height="54" rx="6" fill="#fff" stroke="#9ccBad"/>
+  <text x="251" y="566" text-anchor="middle" class="small" font-weight="700">users</text>
+  <text x="251" y="585" text-anchor="middle" class="small">계정·카테고리</text>
+  <rect x="338" y="544" width="150" height="54" rx="6" fill="#fff" stroke="#9ccBad"/>
+  <text x="413" y="566" text-anchor="middle" class="small" font-weight="700">sessions</text>
+  <text x="413" y="585" text-anchor="middle" class="small">로그인 토큰</text>
+  <rect x="176" y="608" width="150" height="54" rx="6" fill="#fff" stroke="#9ccBad"/>
+  <text x="251" y="630" text-anchor="middle" class="small" font-weight="700">expenses</text>
+  <text x="251" y="649" text-anchor="middle" class="small">지출·수입 내역</text>
+  <rect x="338" y="608" width="150" height="54" rx="6" fill="#fff" stroke="#9ccBad"/>
+  <text x="413" y="630" text-anchor="middle" class="small" font-weight="700">wishlist</text>
+  <text x="413" y="649" text-anchor="middle" class="small">위시리스트</text>
+
+  <!-- arrow server <-> mongo -->
+  <path class="edge" d="M330,430 L330,500" marker-end="url(#arrow)"/>
+  <path class="edge" d="M310,500 L310,430" marker-end="url(#arrow)"/>
+  <text x="336" y="470" class="lbl">motor (async)</text>
+
+  <!-- 외부 API -->
+  <rect x="580" y="500" width="360" height="180" rx="12" fill="#FDEEEE" stroke="#D9534F" stroke-width="2"/>
+  <text x="606" y="528" class="box-title" fill="#B23B37">🌐 외부 API  (서버가 .env 키로 호출)</text>
+  <rect x="606" y="544" width="310" height="52" rx="6" fill="#fff" stroke="#e6a6a3"/>
+  <text x="620" y="566" class="small" font-weight="700">ODsay</text>
+  <text x="620" y="585" class="small">지하철 역 좌표 → 요금 조회</text>
+  <rect x="606" y="606" width="310" height="56" rx="6" fill="#fff" stroke="#e6a6a3"/>
+  <text x="620" y="628" class="small" font-weight="700">네이버 쇼핑 검색</text>
+  <text x="620" y="647" class="small">위시리스트 제품 가격·이미지</text>
+
+  <!-- arrow server -> external -->
+  <path class="edge" d="M700,430 L720,500" marker-end="url(#arrow)"/>
+  <text x="726" y="470" class="lbl">HTTPS 호출</text>
+
+  <!-- note -->
+  <rect x="150" y="700" width="790" height="44" rx="8" fill="#FFF9E6" stroke="#E0C060"/>
+  <text x="170" y="720" class="sub" font-weight="700">⚠️ 지금은 전부 localhost — 이 컴퓨터에서만 접근 가능.</text>
+  <text x="170" y="738" class="small">데이터는 Docker 볼륨에 안전 저장(재시작 OK). 다른 기기에서 쓰려면 → 클라우드 DB(Atlas) + 백엔드 배포 필요.</text>
+</svg>

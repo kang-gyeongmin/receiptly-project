@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Cookie
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -37,6 +38,54 @@ ODSAY_API_KEY = os.getenv("ODSAY_API_KEY", "")
 # 네이버 쇼핑 검색 API (위시리스트 제품 검색). developers.naver.com 에서 무료 발급
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
+
+# PWA 정적 파일(아이콘 등)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# ── PWA (홈 화면 설치용 manifest + 서비스워커) ──────────
+PWA_MANIFEST = {
+    "name": "Receiptly 가계부",
+    "short_name": "Receiptly",
+    "description": "자연어·영수증으로 쉽게 쓰는 AI 가계부",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#f5f5f5",
+    "theme_color": "#4A90D9",
+    "icons": [
+        {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+        {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+    ],
+}
+
+@app.get("/manifest.json")
+async def manifest():
+    return JSONResponse(PWA_MANIFEST)
+
+# 서비스워커: 네트워크 우선(오래된 HTML 캐시 방지), 실패 시 캐시로 폴백
+SERVICE_WORKER_JS = """
+const CACHE = 'receiptly-v1';
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    fetch(e.request)
+      .then(res => {
+        // 아이콘 등 정적만 캐시(오프라인 대비)
+        if (e.request.url.includes('/static/') || e.request.url.endsWith('/manifest.json')) {
+          const copy = res.clone();
+          caches.open(CACHE).then(c => c.put(e.request, copy));
+        }
+        return res;
+      })
+      .catch(() => caches.match(e.request))
+  );
+});
+"""
+
+@app.get("/sw.js")
+async def service_worker():
+    return Response(SERVICE_WORKER_JS, media_type="application/javascript")
 
 # OCR 리더 초기화
 try:
@@ -797,6 +846,17 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <title>Receiptly - 로그인</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#4A90D9">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Receiptly">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
+    <script>
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function() { navigator.serviceWorker.register('/sw.js').catch(function(){}); });
+    }
+    </script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -1005,6 +1065,17 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <title>Receiptly - 가계부</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#4A90D9">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Receiptly">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
+    <script>
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function() { navigator.serviceWorker.register('/sw.js').catch(function(){}); });
+    }
+    </script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; }
