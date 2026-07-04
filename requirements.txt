@@ -20,7 +20,8 @@ Pillow==12.3.0
 numpy==2.5.0
 certifi  # macOS SSL 인증서 (EasyOCR 모델 다운로드)
 
+# 비밀번호 해싱 (bcrypt, 솔트 포함)
+bcrypt==4.1.2
+
 # ── 제거됨 (코드에서 미사용) ──
 #   spacy, PyJWT, python-jose, passlib
-# ── 나중에 비밀번호 해싱 sha256 → bcrypt 교체 시 추가 ──
-#   bcrypt==4.1.2

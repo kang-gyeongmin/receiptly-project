@@ -11,6 +11,7 @@ import re
 import calendar
 import hashlib
 import secrets
+import bcrypt
 import ssl
 import certifi
 import json as _json
@@ -115,16 +116,42 @@ def validate_password(password: str) -> tuple[bool, str]:
     return True, "안전한 비밀번호입니다"
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    """bcrypt(솔트 포함) 해시. bcrypt는 72바이트 제한 → 초과분 잘림."""
+    return bcrypt.hashpw(password.encode()[:72], bcrypt.gensalt()).decode()
+
+def verify_password(password: str, stored: str) -> bool:
+    """bcrypt 해시면 bcrypt로, 레거시 sha256(64 hex)이면 sha256으로 검증."""
+    if stored.startswith("$2"):  # bcrypt
+        try:
+            return bcrypt.checkpw(password.encode()[:72], stored.encode())
+        except Exception:
+            return False
+    return hashlib.sha256(password.encode()).hexdigest() == stored  # 레거시
+
+SESSION_DAYS = 30
 
 def generate_token() -> str:
     return secrets.token_urlsafe(32)
+
+async def create_session(user_id) -> str:
+    token = generate_token()
+    await db.sessions.insert_one({
+        "user_id": user_id,
+        "token": token,
+        "expires_at": (datetime.now() + timedelta(days=SESSION_DAYS)).isoformat(),
+    })
+    return token
 
 async def get_current_user(session: Optional[str] = Cookie(None)):
     if not session:
         return None
     session_doc = await db.sessions.find_one({"token": session})
     if not session_doc:
+        return None
+    # 만료 검증 (레거시 세션엔 expires_at 없을 수 있음 → 통과)
+    exp = session_doc.get("expires_at")
+    if exp and exp < datetime.now().isoformat():
+        await db.sessions.delete_one({"token": session})
         return None
     return await db.users.find_one({"_id": session_doc["user_id"]})
 
@@ -415,24 +442,26 @@ async def signup(username: str = Form(...), password: str = Form(...), password2
     result = await db.users.insert_one(user)
 
     # 자동 로그인
-    token = generate_token()
-    await db.sessions.insert_one({"user_id": result.inserted_id, "token": token})
+    token = await create_session(result.inserted_id)
 
     response = JSONResponse({"status": "success", "message": "회원가입 완료되었습니다"})
-    response.set_cookie("session", token, httponly=True, max_age=86400*30)
+    response.set_cookie("session", token, httponly=True, samesite="lax", max_age=86400*SESSION_DAYS)
     return response
 
 @app.post("/auth/login")
 async def login(username: str = Form(...), password: str = Form(...)):
-    user = await db.users.find_one({"username": username, "password": hash_password(password)})
-    if not user:
+    user = await db.users.find_one({"username": username})
+    if not user or not verify_password(password, user.get("password", "")):
         return JSONResponse({"error": "계정 정보가 일치하지 않습니다"}, status_code=400)
 
-    token = generate_token()
-    await db.sessions.insert_one({"user_id": user["_id"], "token": token})
+    # 레거시 sha256 계정이면 bcrypt로 자동 업그레이드
+    if not user.get("password", "").startswith("$2"):
+        await db.users.update_one({"_id": user["_id"]}, {"$set": {"password": hash_password(password)}})
+
+    token = await create_session(user["_id"])
 
     response = JSONResponse({"status": "success"})
-    response.set_cookie("session", token, httponly=True, max_age=86400*30)
+    response.set_cookie("session", token, httponly=True, samesite="lax", max_age=86400*SESSION_DAYS)
     return response
 
 @app.post("/auth/logout")
@@ -1600,7 +1629,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                     html += '<div style="color: #2e7d32; margin-bottom: 2px;">+' + incomeTotal.toLocaleString() + '원</div>';
                 }
                 for (const [cat, total] of Object.entries(categoryTotals)) {
-                    html += '<div style="color: #666; margin-bottom: 2px;">' + cat + ' ' + total.toLocaleString() + '원</div>';
+                    html += '<div style="color: #666; margin-bottom: 2px;">' + escapeHtml(cat) + ' ' + total.toLocaleString() + '원</div>';
                 }
                 html += '</div>';
             }
@@ -1802,7 +1831,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 statsHtml += '<div class="stat-item"><span>지출 내역이 없습니다</span></div>';
             } else {
                 statsHtml += byCategory.map(c =>
-                    '<div class="stat-item"><span class="category">' + c.category + '</span><span class="amount">' + c.amount.toLocaleString() + '원</span></div>'
+                    '<div class="stat-item"><span class="category">' + escapeHtml(c.category) + '</span><span class="amount">' + c.amount.toLocaleString() + '원</span></div>'
                 ).join('');
             }
             statsDiv.innerHTML = statsHtml;
@@ -1814,8 +1843,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 tableBody.innerHTML = expenses.map(e => {
                     const inc = e.kind === 'income';
                     const amtCell = '<td style="text-align:right; color:' + (inc ? '#2e7d32' : '#333') + ';">' + (inc ? '+' : '') + e.amount.toLocaleString() + '원</td>';
-                    const catCell = '<td>' + (inc ? '수입' : e.category) + '</td>';
-                    return '<tr><td>' + e.date + '</td><td>' + e.store_name + '</td>' + amtCell + catCell + '</tr>';
+                    const catCell = '<td>' + (inc ? '수입' : escapeHtml(e.category)) + '</td>';
+                    return '<tr><td>' + escapeHtml(e.date) + '</td><td>' + escapeHtml(e.store_name) + '</td>' + amtCell + catCell + '</tr>';
                 }).join('');
             }
         } catch (e) {
@@ -2202,25 +2231,27 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         }
     }
 
+    let catModalList = [];
     function renderCategoryList(categories) {
+        catModalList = categories;
         const list = document.getElementById('categoryList');
         list.innerHTML = categories.map((cat, idx) => `
             <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px; background: #f9f9f9; border-radius: 6px; margin-bottom: 8px;">
-                <span id="cat-display-${idx}" style="flex: 1;">${cat}</span>
+                <span id="cat-display-${idx}" style="flex: 1;">${escapeHtml(cat)}</span>
                 <div id="cat-edit-${idx}" style="display: none; flex: 1; display: flex; gap: 5px;">
-                    <input type="text" id="cat-input-${idx}" value="${cat}" style="flex: 1; padding: 5px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px;" />
+                    <input type="text" id="cat-input-${idx}" value="${escapeHtml(cat)}" style="flex: 1; padding: 5px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px;" />
                     <button onclick="saveEdit(${idx})" style="padding: 5px 10px; width: auto; background: #4CAF50; font-size: 12px;">✓</button>
                     <button onclick="cancelEdit(${idx})" style="padding: 5px 10px; width: auto; background: #999; font-size: 12px;">✕</button>
                 </div>
-                <button onclick="startEdit(${idx}, '${cat}')" style="padding: 5px 10px; width: auto; background: #FF9800; font-size: 12px; margin-left: 5px;">수정</button>
-                <button onclick="deleteCategory('${cat}')" style="padding: 5px 10px; width: auto; background: #f44336; font-size: 12px; margin-left: 5px;">삭제</button>
+                <button onclick="startEdit(${idx})" style="padding: 5px 10px; width: auto; background: #FF9800; font-size: 12px; margin-left: 5px;">수정</button>
+                <button onclick="deleteCategory(${idx})" style="padding: 5px 10px; width: auto; background: #f44336; font-size: 12px; margin-left: 5px;">삭제</button>
             </div>
         `).map((html, idx) => html.replace('display: none; flex: 1; display: flex;', 'display: none; flex: 1;')).join('');
     }
 
     let editingIndex = null;
 
-    function startEdit(idx, cat) {
+    function startEdit(idx) {
         if (editingIndex !== null) cancelEdit(editingIndex);
 
         editingIndex = idx;
@@ -2326,7 +2357,9 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         });
     }
 
-    async function deleteCategory(name) {
+    async function deleteCategory(idx) {
+        const name = catModalList[idx];
+        if (name === undefined) return;
         const form = new FormData();
         form.append('name', name);
 
