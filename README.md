@@ -1,6 +1,18 @@
+---
+title: Receiptly
+emoji: 🧾
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Receiptly
 
 영수증 기반 AI 가계부 앱 — 자연어로 입력하면 자동으로 분류하는 똑똑한 가계부
+
+> ℹ️ 맨 위 `---` 블록은 Hugging Face Spaces 배포 설정입니다 (GitHub 렌더링엔 영향 없음).
 
 ## 🎯 핵심 기능
 

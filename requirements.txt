@@ -10,6 +10,7 @@ pydantic==2.13.4
 # MongoDB (motor 3.3.2는 pymongo <4.7 과만 호환)
 motor==3.3.2
 pymongo==4.6.3
+dnspython==2.8.0  # Atlas mongodb+srv:// 연결에 필요
 
 # 환경변수
 python-dotenv==1.2.2

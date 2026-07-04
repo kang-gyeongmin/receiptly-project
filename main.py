@@ -88,9 +88,13 @@ self.addEventListener('fetch', e => {
 async def service_worker():
     return Response(SERVICE_WORKER_JS, media_type="application/javascript")
 
-# OCR 리더 초기화
+# OCR 리더 초기화 (배포 시 EASYOCR_MODEL_DIR에 미리 받은 모델 사용)
 try:
-    reader = easyocr.Reader(['ko', 'en'])
+    _easyocr_dir = os.getenv("EASYOCR_MODEL_DIR")
+    if _easyocr_dir:
+        reader = easyocr.Reader(['ko', 'en'], model_storage_directory=_easyocr_dir)
+    else:
+        reader = easyocr.Reader(['ko', 'en'])
 except Exception as e:
     print(f"⚠️ OCR 초기화 실패: {e}")
     reader = None
