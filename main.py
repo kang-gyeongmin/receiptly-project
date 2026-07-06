@@ -45,8 +45,8 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ── PWA (홈 화면 설치용 manifest + 서비스워커) ──────────
 PWA_MANIFEST = {
-    "name": "Receiptly 가계부",
-    "short_name": "Receiptly",
+    "name": "Zik 가계부",
+    "short_name": "Zik",
     "description": "자연어·영수증으로 쉽게 쓰는 AI 가계부",
     "start_url": "/",
     "display": "standalone",
@@ -883,7 +883,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#4A90D9">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-title" content="Receiptly">
+    <meta name="apple-mobile-web-app-title" content="Zik">
     <link rel="apple-touch-icon" href="/static/icon-192.png">
     <script>
     if ('serviceWorker' in navigator) {
@@ -922,7 +922,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>🧾 Receiptly</h1>
+        <h1 style="display:flex; align-items:center; justify-content:center; gap:8px;"><img src="/static/logo-cat.png" style="height:36px; border-radius:6px;" alt="" onerror="this.remove()" /> Zik</h1>
 
         <div id="login" class="form-section active">
             <form onsubmit="handleLogin(event)">
@@ -1102,7 +1102,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#4A90D9">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-title" content="Receiptly">
+    <meta name="apple-mobile-web-app-title" content="Zik">
     <link rel="apple-touch-icon" href="/static/icon-192.png">
     <script>
     if ('serviceWorker' in navigator) {
@@ -1200,6 +1200,12 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         /* 달력 탭에서만 입력/챗봇 표시. 분석·위시리스트에선 숨김 */
         .hide-input-ui .sidebar { display: none; }
         .hide-input-ui #chat-fab { display: none !important; }
+        /* 로고(고양이 이미지 + Zik) */
+        .header h1 { display: flex; align-items: center; gap: 8px; }
+        .logo-img { height: 34px; width: auto; border-radius: 6px; }
+        /* 챗봇 FAB 고양이 이미지 */
+        #chat-fab { overflow: hidden; padding: 0; }
+        #chat-fab .fab-img { width: 100%; height: 100%; object-fit: cover; }
 
         @media (max-width: 768px) {
             html, body { overflow-x: hidden; }
@@ -1212,9 +1218,13 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             .header h1 { font-size: 24px; }
             .mobile-menu-btn { width: auto; padding: 6px 12px; font-size: 22px; margin: 0; }
             /* 입력창이 가로로 넘치지 않게 */
-            input, select { min-width: 0; max-width: 100%; }
+            input, select { min-width: 0; max-width: 100%; box-sizing: border-box; }
+            input[type="date"] { -webkit-appearance: none; appearance: none; width: 100%; }
             .input-2col { display: flex; gap: 8px; }
             .input-2col input { flex: 1; min-width: 0; }
+            /* 날짜 클릭 시 상세 내역 줄이 넘치면 접기 */
+            .stat-item { flex-wrap: wrap; row-gap: 4px; }
+            .selected-date-info, .stats { max-width: 100%; }
             img { max-width: 100%; }
             /* 달력이 좁은 폰에서 넘치지 않게 */
             .calendar { gap: 4px; }
@@ -1236,7 +1246,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     <div class="container">
         <div class="main">
             <div class="header">
-                <h1>🧾 Receiptly</h1>
+                <h1><img src="/static/logo-cat.png" class="logo-img" alt="" onerror="this.remove()" /> Zik</h1>
                 <button onclick="logout()" class="desktop-only">로그아웃</button>
                 <button class="mobile-only mobile-menu-btn" onclick="toggleMobileMenu()">☰</button>
             </div>
@@ -1388,7 +1398,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             </div>
         </div>
     </div>
-    <button id="chat-fab" onclick="toggleChat(true)">🤖</button>
+    <button id="chat-fab" onclick="toggleChat(true)"><img src="/static/chat-cat.png" class="fab-img" alt="챗봇" onerror="this.parentNode.textContent='🤖'" /></button>
 
     <!-- 카테고리 관리 모달 -->
     <div id="categoryModal" style="display: none !important; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
