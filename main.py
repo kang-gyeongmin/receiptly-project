@@ -879,7 +879,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <title>Receiptly - 로그인</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
     <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#4A90D9">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -1098,7 +1098,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <title>Receiptly - 가계부</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
     <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#4A90D9">
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -1202,15 +1202,28 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         .hide-input-ui #chat-fab { display: none !important; }
 
         @media (max-width: 768px) {
-            .container { grid-template-columns: 1fr; padding: 10px; gap: 12px; }
-            .main, .sidebar { padding: 16px; }
+            html, body { overflow-x: hidden; }
+            .container { grid-template-columns: 1fr; padding: 10px; gap: 12px; max-width: 100%; }
+            .main, .sidebar { padding: 16px; max-width: 100%; overflow-x: hidden; }
             .desktop-only { display: none !important; }
             .mobile-only { display: flex; }
             .tabs { display: none; }
             .header { margin-bottom: 16px; padding-bottom: 12px; }
             .header h1 { font-size: 24px; }
             .mobile-menu-btn { width: auto; padding: 6px 12px; font-size: 22px; margin: 0; }
+            /* 입력창이 가로로 넘치지 않게 */
+            input, select { min-width: 0; max-width: 100%; }
             .input-2col { display: flex; gap: 8px; }
+            .input-2col input { flex: 1; min-width: 0; }
+            img { max-width: 100%; }
+            /* 달력이 좁은 폰에서 넘치지 않게 */
+            .calendar { gap: 4px; }
+            .calendar-label { font-size: 10px; padding: 5px 0; }
+            .calendar-day { min-height: 54px; padding: 6px 2px; font-size: 12px; overflow: hidden; }
+            .calendar-day .amount, .calendar-day div { font-size: 10px; }
+            /* 위시리스트 항목이 가로로 넘치면 줄바꿈 */
+            .wl-item { flex-wrap: wrap; row-gap: 6px; }
+            .wl-item .category, .wl-item > div { min-width: 0; }
             #chat-fab { display: flex; }
             #chat-section { position: fixed; left: 8px; right: 8px; top: 66px; bottom: 84px; background: white; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.3); z-index: 1450; flex-direction: column; padding: 12px; display: none; }
             #chat-section.open { display: flex; }
