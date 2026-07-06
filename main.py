@@ -1189,6 +1189,33 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         .toast.show { opacity: 1; transform: translateY(0); }
         .toast.success { background: #4CAF50; }
         .toast.error { background: #f44336; }
+
+        /* ── 모바일: ☰ 메뉴 + 챗봇 FAB + 반응형 ── */
+        .mobile-only { display: none; }
+        .mobile-menu { display: none; position: absolute; top: 62px; right: 16px; background: white; border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,0.2); flex-direction: column; z-index: 1500; overflow: hidden; }
+        .mobile-menu button { width: 170px; text-align: left; margin: 0; border-radius: 0; background: white; color: #333; padding: 14px 16px; border-bottom: 1px solid #eee; font-size: 15px; }
+        .mobile-menu button:hover { background: #f5f5f5; }
+        #chat-fab { display: none; position: fixed; right: 16px; bottom: 16px; width: 58px; height: 58px; border-radius: 50%; font-size: 26px; padding: 0; box-shadow: 0 4px 14px rgba(0,0,0,0.3); z-index: 1400; align-items: center; justify-content: center; }
+        .chat-header-row { display: flex; justify-content: space-between; align-items: center; }
+        /* 달력 탭에서만 입력/챗봇 표시. 분석·위시리스트에선 숨김 */
+        .hide-input-ui .sidebar { display: none; }
+        .hide-input-ui #chat-fab { display: none !important; }
+
+        @media (max-width: 768px) {
+            .container { grid-template-columns: 1fr; padding: 10px; gap: 12px; }
+            .main, .sidebar { padding: 16px; }
+            .desktop-only { display: none !important; }
+            .mobile-only { display: flex; }
+            .tabs { display: none; }
+            .header { margin-bottom: 16px; padding-bottom: 12px; }
+            .header h1 { font-size: 24px; }
+            .mobile-menu-btn { width: auto; padding: 6px 12px; font-size: 22px; margin: 0; }
+            .input-2col { display: flex; gap: 8px; }
+            #chat-fab { display: flex; }
+            #chat-section { position: fixed; left: 8px; right: 8px; top: 66px; bottom: 84px; background: white; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.3); z-index: 1450; flex-direction: column; padding: 12px; display: none; }
+            #chat-section.open { display: flex; }
+            #chat-section .chatbot { flex: 1; height: auto; }
+        }
     </style>
 </head>
 <body>
@@ -1197,7 +1224,14 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         <div class="main">
             <div class="header">
                 <h1>🧾 Receiptly</h1>
-                <button onclick="logout()">로그아웃</button>
+                <button onclick="logout()" class="desktop-only">로그아웃</button>
+                <button class="mobile-only mobile-menu-btn" onclick="toggleMobileMenu()">☰</button>
+            </div>
+            <div id="mobile-menu" class="mobile-menu">
+                <button onclick="mobileNav('calendar')">📅 달력</button>
+                <button onclick="mobileNav('analysis')">📊 분석</button>
+                <button onclick="mobileNav('wishlist')">🛍️ 위시리스트</button>
+                <button onclick="logout()">🚪 로그아웃</button>
             </div>
 
             <div class="tabs">
@@ -1304,8 +1338,10 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 <button type="button" id="kind-expense" onclick="setKind('expense')" style="flex:1; margin:0; background:#4A90D9;">지출</button>
                 <button type="button" id="kind-income" onclick="setKind('income')" style="flex:1; margin:0; background:#ccc;">수입</button>
             </div>
-            <input type="text" id="store" placeholder="가게명" />
-            <input type="number" id="amount" placeholder="금액" />
+            <div class="input-2col">
+                <input type="text" id="store" placeholder="가게명" />
+                <input type="number" id="amount" placeholder="금액" />
+            </div>
             <input type="date" id="date" />
             <div style="display: flex; gap: 5px;">
                 <select id="category" style="flex: 1;">
@@ -1318,22 +1354,28 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             </div>
             <button onclick="addExpense()">저장</button>
 
-            <hr />
+            <hr class="desktop-only" />
 
-            <h3>💬 챗봇</h3>
-            <div class="chatbot">
-                <div class="chat-messages" id="messages">
-                    <div class="chat-message bot">안녕하세요! 이렇게 해보세요:<br>• 저장: "6/30 샐러디 9900원", "월급 300만원"<br>• 조회: "이번달 얼마 썼어?"<br>• 지하철 요금: "지하철 강남역에서 홍대입구역 얼마?"</div>
+            <div id="chat-section">
+                <div class="chat-header-row">
+                    <h3>💬 챗봇</h3>
+                    <button class="mobile-only" onclick="toggleChat(false)" style="width:auto; margin:0; padding:4px 12px; background:#999;">✕</button>
                 </div>
-                <div class="chat-input">
-                    <input type="file" id="chat-image" accept="image/*" style="display:none;" onchange="sendChatImage(this)" />
-                    <button onclick="document.getElementById('chat-image').click()" title="영수증 사진" style="width:40px; padding:8px;">📷</button>
-                    <input type="text" id="chat-input" placeholder="예: 6/30 샐러디 9900원" onkeypress="if(event.key=='Enter') sendChat()" />
-                    <button onclick="sendChat()">→</button>
+                <div class="chatbot">
+                    <div class="chat-messages" id="messages">
+                        <div class="chat-message bot">안녕하세요! 이렇게 해보세요:<br>• 저장: "6/30 샐러디 9900원", "월급 300만원"<br>• 조회: "이번달 얼마 썼어?"<br>• 지하철 요금: "지하철 강남역에서 홍대입구역 얼마?"</div>
+                    </div>
+                    <div class="chat-input">
+                        <input type="file" id="chat-image" accept="image/*" style="display:none;" onchange="sendChatImage(this)" />
+                        <button onclick="document.getElementById('chat-image').click()" title="영수증 사진" style="width:40px; padding:8px;">📷</button>
+                        <input type="text" id="chat-input" placeholder="예: 6/30 샐러디 9900원" onkeypress="if(event.key=='Enter') sendChat()" />
+                        <button onclick="sendChat()">→</button>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
+    <button id="chat-fab" onclick="toggleChat(true)">🤖</button>
 
     <!-- 카테고리 관리 모달 -->
     <div id="categoryModal" style="display: none !important; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
@@ -1414,21 +1456,37 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
         document.getElementById(tab).classList.add('active');
-        event.target.classList.add('active');
-        // 위시리스트 탭에선 사이드바(지출 입력+챗봇) 숨기고 전체폭 사용
-        const sidebar = document.querySelector('.sidebar');
-        const container = document.querySelector('.container');
-        if (tab === 'wishlist') {
-            if (sidebar) sidebar.style.display = 'none';
-            if (container) container.style.gridTemplateColumns = '1fr';
-        } else {
-            if (sidebar) sidebar.style.display = '';
-            if (container) container.style.gridTemplateColumns = '';
+        if (event && event.target && event.target.classList && event.target.classList.contains('tab')) {
+            event.target.classList.add('active');
         }
+
+        // 입력/챗봇은 '달력' 탭에서만 표시. 분석·위시리스트에선 숨김
+        const isCalendar = (tab === 'calendar');
+        document.body.classList.toggle('hide-input-ui', !isCalendar);
+        const container = document.querySelector('.container');
+        if (container) container.style.gridTemplateColumns = isCalendar ? '' : '1fr';
+        const cs = document.getElementById('chat-section');
+        if (cs) cs.classList.remove('open');            // 탭 이동 시 챗봇 닫기
+        const mm = document.getElementById('mobile-menu');
+        if (mm) mm.style.display = 'none';              // 메뉴 닫기
 
         if (tab === 'calendar') renderCalendar();
         else if (tab === 'wishlist') loadWishlist();
         else loadAnalysis();
+    }
+
+    function toggleMobileMenu() {
+        const m = document.getElementById('mobile-menu');
+        if (m) m.style.display = (m.style.display === 'flex') ? 'none' : 'flex';
+    }
+    function mobileNav(tab) {
+        switchTab(tab);
+    }
+    function toggleChat(open) {
+        const s = document.getElementById('chat-section');
+        if (!s) return;
+        if (open === undefined) open = !s.classList.contains('open');
+        s.classList.toggle('open', open);
     }
 
     // ── 위시리스트 ──
