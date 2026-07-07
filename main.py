@@ -522,6 +522,7 @@ async def signup(username: str = Form(...), password: str = Form(...), password2
         "password": hash_password(password),
         "categories": DEFAULT_CATEGORIES,
         "accounts": DEFAULT_ACCOUNTS,
+        "onboarded": False,  # 첫 접속 시 은행 등록 온보딩
         "created_at": datetime.now().isoformat()
     }
     result = await db.users.insert_one(user)
@@ -1563,6 +1564,23 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 <button onclick="addNewAccount()" style="width: 60px;">추가</button>
             </div>
             <button onclick="closeAccountModal()" style="margin-top: 20px; background: #999;">닫기</button>
+        </div>
+    </div>
+
+    <!-- 첫 접속 온보딩: 은행 등록 -->
+    <div id="onboardModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.55); z-index: 1100; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 14px; padding: 26px; width: 92%; max-width: 420px; max-height: 88vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.25);">
+            <h2 style="margin-bottom: 6px;">🏦 환영해요!</h2>
+            <p style="color: #666; font-size: 14px; margin-bottom: 16px; line-height: 1.5;">쓰는 은행/카드를 등록하면 내역을 계좌별로 관리할 수 있어요.<br>(나중에 🏦 버튼에서 바꿀 수 있어요)</p>
+            <div style="font-size: 13px; font-weight: 600; margin-bottom: 6px;">자주 쓰는 곳 (눌러서 추가)</div>
+            <div id="bankChips" style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px;"></div>
+            <div style="display: flex; gap: 5px; margin-bottom: 16px;">
+                <input type="text" id="onboardInput" placeholder="직접 입력 (예: 케이뱅크)" style="flex: 1;" onkeypress="if(event.key=='Enter') onboardAddCustom()" />
+                <button onclick="onboardAddCustom()" style="width: 60px;">추가</button>
+            </div>
+            <div style="font-size: 13px; font-weight: 600; margin-bottom: 6px;">내 계좌/카드</div>
+            <div id="onboardList" style="max-height: 180px; overflow-y: auto; margin-bottom: 18px;"></div>
+            <button onclick="onboardComplete()" style="padding: 13px; font-size: 15px;">시작하기</button>
         </div>
     </div>
 
@@ -2839,10 +2857,77 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         if (m) m.addEventListener('click', function(e) { if (e.target === m) closeAccountModal(); });
     });
 
+    // ── 첫 접속 온보딩 (은행 등록) ──
+    const COMMON_BANKS = ["카카오뱅크", "토스뱅크", "국민은행", "신한은행", "우리은행", "하나은행", "농협", "케이뱅크", "현금", "신용카드"];
+    async function checkOnboarding() {
+        try {
+            const res = await fetch('/api/me');
+            const data = await res.json();
+            if (data.accounts) userAccounts = data.accounts;
+            if (!data.onboarded) openOnboarding();
+        } catch (e) {}
+    }
+    function openOnboarding() {
+        const box = document.getElementById('bankChips');
+        box.innerHTML = COMMON_BANKS.map((b, i) =>
+            '<button onclick="onboardAddQuick(' + i + ')" style="width:auto; margin:0; padding:6px 12px; font-size:13px; background:#eef3f9; color:#333; border:1px solid #cfe0f2;">' + escapeHtml(b) + '</button>'
+        ).join('');
+        renderOnboardList();
+        document.getElementById('onboardModal').style.display = 'flex';
+    }
+    async function onboardAddQuick(i) { await onboardAdd(COMMON_BANKS[i]); }
+    async function onboardAddCustom() {
+        const el = document.getElementById('onboardInput');
+        const v = el.value.trim();
+        if (!v) return;
+        el.value = '';
+        await onboardAdd(v);
+    }
+    async function onboardAdd(name) {
+        const form = new FormData(); form.append('name', name);
+        const res = await fetch('/api/accounts/add', {method: 'POST', body: form});
+        const data = await res.json();
+        if (data.status === 'success') {
+            userAccounts = data.accounts;
+            updateAccountOptions(data.accounts);
+            renderOnboardList();
+        } else if (!(data.error && data.error.indexOf('이미') !== -1)) {
+            showToast(data.error || '오류가 발생했습니다', 'error');
+        }
+    }
+    function renderOnboardList() {
+        const list = document.getElementById('onboardList');
+        if (!list) return;
+        list.innerHTML = (userAccounts || []).map((a, idx) =>
+            '<div style="display:flex; justify-content:space-between; align-items:center; padding:8px 10px; background:#f9f9f9; border-radius:6px; margin-bottom:6px;">' +
+                '<span>' + escapeHtml(a) + '</span>' +
+                '<button onclick="onboardDelete(' + idx + ')" style="width:auto; margin:0; padding:3px 10px; font-size:12px; background:#f44336;">삭제</button>' +
+            '</div>'
+        ).join('') || '<div style="color:#999; font-size:13px;">위에서 은행을 추가해보세요.</div>';
+    }
+    async function onboardDelete(idx) {
+        const name = userAccounts[idx];
+        if (name === undefined) return;
+        const form = new FormData(); form.append('name', name);
+        const res = await fetch('/api/accounts/delete', {method: 'POST', body: form});
+        const data = await res.json();
+        if (data.status === 'success') {
+            userAccounts = data.accounts;
+            updateAccountOptions(data.accounts);
+            renderOnboardList();
+        }
+    }
+    async function onboardComplete() {
+        try { await fetch('/api/onboard/complete', {method: 'POST'}); } catch (e) {}
+        document.getElementById('onboardModal').style.display = 'none';
+        loadAccounts();
+    }
+
     document.getElementById('date').valueAsDate = new Date();
     loadExpensesAndRender();
     loadCategories();
     loadAccounts();
+    checkOnboarding();
     </script>
 </body>
 </html>"""
@@ -2918,6 +3003,25 @@ async def rename_category(old_name: str = Form(...), new_name: str = Form(...), 
         {"$set": {"categories": categories}}
     )
     return {"status": "success", "categories": categories}
+
+# ── 사용자 상태 / 온보딩 ────────────────────────────
+@app.get("/api/me")
+async def get_me(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    accounts = user.get("accounts", DEFAULT_ACCOUNTS)
+    # 온보딩 완료 플래그가 없고 계좌도 기본 상태면 온보딩 필요
+    onboarded = bool(user.get("onboarded")) or len(accounts) > 1
+    return {"username": user.get("username"), "onboarded": onboarded, "accounts": accounts}
+
+@app.post("/api/onboard/complete")
+async def complete_onboard(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"onboarded": True}})
+    return {"status": "success"}
 
 # ── 계좌(은행/카드) 관리 API ────────────────────────
 @app.get("/api/accounts")
