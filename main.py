@@ -1162,9 +1162,9 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         button:hover { background: #357ABD; }
         button:disabled { background: #ccc; cursor: not-allowed; }
 
-        .chatbot { border: 1px solid #ddd; border-radius: 8px; display: flex; flex-direction: column; height: 500px; }
-        .chat-messages { flex: 1; overflow-y: auto; padding: 15px; font-size: 13px; }
-        .chat-message { margin: 8px 0; padding: 10px; border-radius: 6px; word-wrap: break-word; }
+        .chatbot { border: 1px solid #ddd; border-radius: 8px; display: flex; flex-direction: column; height: 500px; min-height: 0; }
+        .chat-messages { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; padding: 15px; font-size: 13px; }
+        .chat-message { margin: 8px 0; padding: 10px; border-radius: 6px; word-wrap: break-word; overflow-wrap: anywhere; word-break: break-word; max-width: 100%; }
         .chat-message.bot { background: #E8F4F8; }
         .chat-message.user { background: #4A90D933; text-align: right; }
         .chat-input { padding: 10px; border-top: 1px solid #ddd; display: flex; gap: 5px; }
@@ -1237,7 +1237,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             #chat-fab { display: flex; }
             #chat-section { position: fixed; left: 8px; right: 8px; top: 66px; bottom: 84px; background: white; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.3); z-index: 1450; flex-direction: column; padding: 12px; display: none; }
             #chat-section.open { display: flex; }
-            #chat-section .chatbot { flex: 1; height: auto; }
+            #chat-section .chatbot { flex: 1; height: auto; min-height: 0; border: none; }
+            #chat-section .chat-header-row { flex-shrink: 0; }
         }
     </style>
 </head>
@@ -1510,6 +1511,12 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         if (!s) return;
         if (open === undefined) open = !s.classList.contains('open');
         s.classList.toggle('open', open);
+        // 챗봇 열면 뒤 배경 스크롤 잠금
+        document.body.style.overflow = open ? 'hidden' : '';
+        if (open) {
+            const m = document.getElementById('messages');
+            if (m) m.scrollTop = m.scrollHeight;  // 최신 대화로
+        }
     }
 
     // ── 위시리스트 ──
@@ -1697,10 +1704,12 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
             const categoryTotals = {};
             let incomeTotal = 0;
+            let expenseTotal = 0;
             dayExpenses.forEach(e => {
                 if (e.kind === 'income') {
                     incomeTotal += e.amount;
                 } else {
+                    expenseTotal += e.amount;
                     if (!categoryTotals[e.category]) categoryTotals[e.category] = 0;
                     categoryTotals[e.category] += e.amount;
                 }
@@ -1709,12 +1718,18 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             // HTML 구성
             let html = '<div class="date">' + day + '</div>';
             if (dayExpenses.length > 0) {
+                const isMobile = window.matchMedia('(max-width: 768px)').matches;
                 html += '<div style="font-size: 11px; margin-top: 4px;">';
-                if (incomeTotal > 0) {
-                    html += '<div style="color: #2e7d32; margin-bottom: 2px;">+' + incomeTotal.toLocaleString() + '원</div>';
-                }
-                for (const [cat, total] of Object.entries(categoryTotals)) {
-                    html += '<div style="color: #666; margin-bottom: 2px;">' + escapeHtml(cat) + ' ' + total.toLocaleString() + '원</div>';
+                if (isMobile) {
+                    // 모바일: 카테고리 없이 -지출/+수입 총액만
+                    if (expenseTotal > 0) html += '<div style="color: #e74c3c; margin-bottom: 2px;">-' + expenseTotal.toLocaleString() + '원</div>';
+                    if (incomeTotal > 0) html += '<div style="color: #2e7d32; margin-bottom: 2px;">+' + incomeTotal.toLocaleString() + '원</div>';
+                } else {
+                    // 데스크톱: 수입 + 카테고리별 지출
+                    if (incomeTotal > 0) html += '<div style="color: #2e7d32; margin-bottom: 2px;">+' + incomeTotal.toLocaleString() + '원</div>';
+                    for (const [cat, total] of Object.entries(categoryTotals)) {
+                        html += '<div style="color: #666; margin-bottom: 2px;">' + escapeHtml(cat) + ' ' + total.toLocaleString() + '원</div>';
+                    }
                 }
                 html += '</div>';
             }
