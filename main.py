@@ -253,6 +253,45 @@ def extract_expense_from_ocr(text: str) -> dict:
 
     return result
 
+# 통장/카드 내역(여러 건) OCR → 거래 리스트. "날짜 설명 금액원" 반복 추출(잔액은 앞에 날짜가 없어 자동 제외)
+_TXN_INCOME_KWS = ["급여", "월급", "이자", "입금", "혜택", "받기", "캐시백", "환급", "지원금", "정산", "이체입금"]
+
+def extract_transactions_from_ocr(text: str) -> list:
+    today = datetime.now()
+    txns = []
+    for m in re.finditer(r'(\d{1,2})[.\-/](\d{1,2})\s+(.+?)\s*(-?\d[\d,]*)\s*원', text):
+        mo, d = int(m.group(1)), int(m.group(2))
+        if not (1 <= mo <= 12 and 1 <= d <= 31):
+            continue
+        desc = re.sub(r'\s+', ' ', m.group(3)).strip(" .,-·|")
+        raw = m.group(4).strip()
+        amount = int(raw.replace(',', '').replace('-', '') or 0)
+        if amount <= 0 or not desc:
+            continue
+        # 부호(-)=지출, 없으면 수입키워드/기본=수입 (통장 기준). 확인 리스트에서 수정 가능
+        if raw.startswith('-'):
+            kind = "expense"
+        elif any(k in desc for k in _TXN_INCOME_KWS):
+            kind = "income"
+        else:
+            kind = "expense"
+        yr = today.year - (1 if mo > today.month else 0)
+        txns.append({
+            "date": f"{yr}-{mo:02d}-{d:02d}",
+            "store": desc[:40],
+            "amount": amount,
+            "kind": kind,
+        })
+    return txns
+
+def keyword_category(categories: list, store: str) -> str:
+    """DB 조회 없이 키워드로만 카테고리 추정 (여러 건 일괄용)."""
+    low = (store or "").lower()
+    for cat, kws in CATEGORY_KEYWORD_HINTS.items():
+        if cat in categories and any(k in low for k in kws):
+            return cat
+    return categories[0] if categories else "기타"
+
 # ── ⚠️ OCR 미사용 블록 끝 ──────────────────────────────
 
 # ── 자연어 파싱 (챗봇 저장에 사용) ──────────────────────
@@ -854,6 +893,21 @@ async def chat_image(file: UploadFile = File(...), session: Optional[str] = Cook
     if not text:
         return {"type": "message", "response": "사진에서 글자를 읽지 못했어요. 더 밝고 선명한 사진으로 다시 시도해주세요."}
 
+    cats = user.get("categories", DEFAULT_CATEGORIES)
+
+    # ① 통장/카드 여러 건 목록인지 먼저 시도
+    txns = extract_transactions_from_ocr(text)
+    if len(txns) >= 2:
+        for t in txns:
+            t["category"] = keyword_category(cats, t["store"])
+        return {
+            "type": "confirm_list",
+            "items": txns,
+            "categories": cats,
+            "response": f"{len(txns)}건을 읽었어요. 확인하고 저장하세요. (수입/지출·금액 수정 가능)",
+        }
+
+    # ② 단건 영수증
     parsed = extract_expense_from_ocr(text)
     if parsed["amount"] is None:
         preview = text[:120]
@@ -869,7 +923,7 @@ async def chat_image(file: UploadFile = File(...), session: Optional[str] = Cook
             "category": category,
             "kind": "expense",
         },
-        "categories": user.get("categories", DEFAULT_CATEGORIES),
+        "categories": cats,
         "response": "영수증에서 읽었어요. 확인 후 저장하세요.",
     }
 
@@ -2111,6 +2165,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
             if (data.type === 'confirm' && data.expense) {
                 renderConfirmCard(data.expense, data.categories || []);
+            } else if (data.type === 'confirm_list' && data.items) {
+                renderConfirmListCard(data);
             } else {
                 messages.innerHTML += '<div class="chat-message bot">' + (data.response || '') + '</div>';
             }
@@ -2320,6 +2376,86 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         delete pendingMulti[n];
         if (lastPending && lastPending.n === n) lastPending = null;
         const card = document.getElementById('cm' + n);
+        if (card) card.outerHTML = '<div class="chat-message bot">취소했어요.</div>';
+    }
+
+    // 통장/카드 여러 건(각기 다른 거래) 확인 리스트
+    const pendingLists = {};
+    function renderConfirmListCard(data) {
+        const messages = document.getElementById('messages');
+        const n = chatCardSeq++;
+        const items = data.items || [];
+        pendingLists[n] = items;
+        if ((!userCategories || userCategories.length === 0) && data.categories) userCategories = data.categories;
+
+        let rows = '';
+        items.forEach((it, i) => {
+            rows += '<div id="row-' + n + '-' + i + '" style="border-bottom:1px solid #eee; padding:6px 0;">' +
+                '<div style="display:flex; justify-content:space-between; align-items:center; gap:4px;">' +
+                    '<span style="font-size:11px; color:#888; white-space:nowrap;">' + escapeHtml(it.date.slice(5)) + '</span>' +
+                    '<select id="li' + n + '_' + i + '_kind" style="width:auto; margin:0; padding:3px; font-size:11px;">' +
+                        '<option value="expense"' + (it.kind === 'income' ? '' : ' selected') + '>지출</option>' +
+                        '<option value="income"' + (it.kind === 'income' ? ' selected' : '') + '>수입</option>' +
+                    '</select>' +
+                    '<button onclick="removeListItem(' + n + ',' + i + ')" style="width:auto; margin:0; padding:2px 8px; font-size:11px; background:#f44336;">✕</button>' +
+                '</div>' +
+                '<div style="display:flex; gap:4px; margin-top:4px;">' +
+                    '<input id="li' + n + '_' + i + '_store" value="' + escapeHtml(it.store) + '" style="flex:2; margin:0; padding:4px; font-size:12px; min-width:0;" />' +
+                    '<input id="li' + n + '_' + i + '_amount" type="number" value="' + Number(it.amount) + '" style="flex:1; margin:0; padding:4px; font-size:12px; min-width:0;" />' +
+                '</div>' +
+            '</div>';
+        });
+
+        messages.innerHTML +=
+            '<div class="chat-message bot" id="cl' + n + '" style="text-align:left;">' +
+                '<div style="font-weight:600; margin-bottom:6px;">' + items.length + '건을 읽었어요 <span style="font-weight:400; color:#888; font-size:12px;">(수정/✕삭제 후 저장)</span></div>' +
+                '<div style="max-height:280px; overflow-y:auto; overscroll-behavior:contain;">' + rows + '</div>' +
+                '<div style="display:flex; gap:5px; margin-top:8px;">' +
+                    '<button onclick="confirmSaveList(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px;">저장</button>' +
+                    '<button onclick="cancelList(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px; background:#999;">취소</button>' +
+                '</div>' +
+            '</div>';
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    function removeListItem(n, i) {
+        const r = document.getElementById('row-' + n + '-' + i);
+        if (r) r.remove();
+    }
+
+    async function confirmSaveList(n) {
+        const items = pendingLists[n];
+        if (!items) return;
+        let ok = 0;
+        for (let i = 0; i < items.length; i++) {
+            const row = document.getElementById('row-' + n + '-' + i);
+            if (!row) continue;  // ✕로 삭제된 항목
+            const store = document.getElementById('li' + n + '_' + i + '_store').value.trim();
+            const amount = document.getElementById('li' + n + '_' + i + '_amount').value;
+            const kind = document.getElementById('li' + n + '_' + i + '_kind').value;
+            if (!store || !amount || parseInt(amount) <= 0) continue;
+            const form = new FormData();
+            form.append('date', items[i].date);
+            form.append('store', store);
+            form.append('amount', parseInt(amount));
+            form.append('category', items[i].category || (userCategories[0] || '기타'));
+            form.append('kind', kind);
+            try {
+                const res = await fetch('/add/expense', {method: 'POST', body: form});
+                const r = await res.json();
+                if (r.status === 'success') ok++;
+            } catch (e) { /* 계속 */ }
+        }
+        const card = document.getElementById('cl' + n);
+        if (card) card.outerHTML = '<div class="chat-message bot">✅ ' + ok + '건 저장 완료</div>';
+        delete pendingLists[n];
+        loadExpensesAndRender();
+        document.getElementById('messages').scrollTop = 1e9;
+    }
+
+    function cancelList(n) {
+        delete pendingLists[n];
+        const card = document.getElementById('cl' + n);
         if (card) card.outerHTML = '<div class="chat-message bot">취소했어요.</div>';
     }
 
