@@ -1374,13 +1374,15 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     <div class="container">
         <div class="main">
             <div class="header">
-                <div style="display:flex; align-items:center; gap:8px; z-index:1;">
-                    <img id="header-pic" src="/static/logo-cat.png" alt="" onerror="this.style.visibility='hidden'" style="width:38px; height:38px; border-radius:50%; object-fit:cover;" />
-                    <span id="header-nick" style="font-weight:600; font-size:15px;"></span>
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <img id="header-pic" src="/static/logo-cat.png" alt="" onerror="this.style.visibility='hidden'" style="width:44px; height:44px; border-radius:50%; object-fit:cover; flex-shrink:0;" />
+                    <div style="display:flex; flex-direction:column; line-height:1.15;">
+                        <span style="font-size:24px; font-weight:800; color:#333;">Zik</span>
+                        <span id="header-nick" style="font-size:13px; color:#666;"></span>
+                    </div>
                 </div>
-                <div style="position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); font-size:26px; font-weight:800; color:#333; pointer-events:none;">Zik</div>
-                <button onclick="openMyPage()" class="desktop-only" style="width:auto; z-index:1;">마이페이지</button>
-                <button class="mobile-only mobile-menu-btn" onclick="toggleMobileMenu()" style="z-index:1;">☰</button>
+                <button onclick="openMyPage()" class="desktop-only" style="width:auto;">마이페이지</button>
+                <button class="mobile-only mobile-menu-btn" onclick="toggleMobileMenu()">☰</button>
             </div>
             <div id="mobile-menu" class="mobile-menu">
                 <button onclick="mobileNav('calendar')">📅 달력</button>
@@ -1605,9 +1607,11 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 <img id="mypage-pic" src="/static/logo-cat.png" alt="" onerror="this.style.visibility='hidden'" style="width:90px; height:90px; border-radius:50%; object-fit:cover; border:2px solid #eee;" />
                 <input type="file" id="mypage-pic-file" accept="image/*" style="display:none;" onchange="changeProfilePic(this)" />
                 <div style="display:flex; gap:6px; justify-content:center; margin-top:8px;">
-                    <button onclick="document.getElementById('mypage-pic-file').click()" style="width:auto; padding:6px 12px; font-size:13px;">사진 변경</button>
+                    <button onclick="document.getElementById('mypage-pic-file').click()" style="width:auto; padding:6px 12px; font-size:13px;">내 사진 올리기</button>
                     <button onclick="resetProfilePic()" style="width:auto; padding:6px 12px; font-size:13px; background:#999;">기본으로</button>
                 </div>
+                <div style="font-size:12px; color:#888; margin:12px 0 6px;">또는 기본 로고에서 선택</div>
+                <div id="preset-avatars" style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap;"></div>
             </div>
             <label style="display:block; font-size:13px; color:#666; margin-bottom:4px;">닉네임</label>
             <div style="display:flex; gap:5px; margin-bottom:16px;">
@@ -2932,11 +2936,28 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     }
 
     // ── 마이페이지 ──
+    const PRESET_AVATARS = ['/static/avatar1.png', '/static/avatar2.png', '/static/avatar3.png', '/static/avatar4.png', '/static/avatar5.png'];
     function openMyPage() {
         document.getElementById('mypage-nick').value = myNickname;
         document.getElementById('mypage-cur-pw').value = '';
         document.getElementById('mypage-new-pw').value = '';
+        const box = document.getElementById('preset-avatars');
+        if (box) box.innerHTML = PRESET_AVATARS.map((u, i) =>
+            '<img src="' + u + '" onclick="selectPreset(' + i + ')" style="width:48px; height:48px; border-radius:50%; cursor:pointer; border:2px solid #eee;" />'
+        ).join('');
         document.getElementById('myPageModal').style.display = 'flex';
+    }
+    async function selectPreset(i) {
+        const url = PRESET_AVATARS[i];
+        const form = new FormData(); form.append('url', url);
+        const res = await fetch('/api/profile/pic/preset', {method: 'POST', body: form});
+        const data = await res.json();
+        if (data.status === 'success') {
+            document.getElementById('mypage-pic').src = url;
+            const pic = document.getElementById('header-pic');
+            if (pic) { pic.src = url; pic.style.visibility = 'visible'; }
+            showToast('프로필 사진이 변경됐어요', 'success');
+        } else showToast(data.error || '변경 실패', 'error');
     }
     function closeMyPage() { document.getElementById('myPageModal').style.display = 'none'; }
     async function saveNickname() {
@@ -3212,6 +3233,18 @@ async def reset_profile_pic(session: Optional[str] = Cookie(None)):
         return JSONResponse({"error": "로그인 필요"}, status_code=401)
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"profile_pic": ""}})
     return {"status": "success"}
+
+PRESET_AVATARS = ["/static/avatar1.png", "/static/avatar2.png", "/static/avatar3.png", "/static/avatar4.png", "/static/avatar5.png"]
+
+@app.post("/api/profile/pic/preset")
+async def set_preset_pic(url: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    if url not in PRESET_AVATARS:
+        return JSONResponse({"error": "잘못된 이미지입니다"}, status_code=400)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"profile_pic": url}})
+    return {"status": "success", "profile_pic": url}
 
 @app.post("/api/profile/delete")
 async def delete_account_user(session: Optional[str] = Cookie(None)):
