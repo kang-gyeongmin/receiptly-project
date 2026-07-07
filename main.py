@@ -41,6 +41,12 @@ ODSAY_API_KEY = os.getenv("ODSAY_API_KEY", "")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
+# 관리자 닉네임 (이 닉네임 계정만 관리자 기능 접근). HF Secrets 등 .env 의 ADMIN_NICKNAME
+ADMIN_NICKNAME = os.getenv("ADMIN_NICKNAME", "")
+
+def is_admin(user) -> bool:
+    return bool(ADMIN_NICKNAME) and user and user.get("username") == ADMIN_NICKNAME
+
 # PWA 정적 파일(아이콘 등)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -146,6 +152,8 @@ async def create_session(user_id) -> str:
         "token": token,
         "expires_at": (datetime.now() + timedelta(days=SESSION_DAYS)).isoformat(),
     })
+    # 마지막 접속 시각 기록 (관리자 통계용)
+    await db.users.update_one({"_id": user_id}, {"$set": {"last_login": datetime.now().isoformat()}})
     return token
 
 async def get_current_user(session: Optional[str] = Cookie(None)):
@@ -1381,13 +1389,19 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                         <span id="header-nick" style="font-size:13px; color:#666;"></span>
                     </div>
                 </div>
-                <button onclick="openMyPage()" class="desktop-only" style="width:auto;">마이페이지</button>
+                <div class="desktop-only" style="display:flex; gap:6px;">
+                    <button onclick="openFeedback()" style="width:auto;">💬 문의</button>
+                    <button onclick="openAdmin()" class="admin-only" style="width:auto; display:none;">🛠 관리자</button>
+                    <button onclick="openMyPage()" style="width:auto;">마이페이지</button>
+                </div>
                 <button class="mobile-only mobile-menu-btn" onclick="toggleMobileMenu()">☰</button>
             </div>
             <div id="mobile-menu" class="mobile-menu">
                 <button onclick="mobileNav('calendar')">📅 달력</button>
                 <button onclick="mobileNav('analysis')">📊 분석</button>
                 <button onclick="mobileNav('wishlist')">🛍️ 위시리스트</button>
+                <button onclick="openFeedback(); toggleMobileMenu();">💬 문의/건의</button>
+                <button class="admin-only" style="display:none;" onclick="openAdmin(); toggleMobileMenu();">🛠 관리자</button>
                 <button onclick="openMyPage(); toggleMobileMenu();">👤 마이페이지</button>
             </div>
 
@@ -1626,6 +1640,35 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             <button onclick="logout()" style="background:#666; margin-bottom:8px;">로그아웃</button>
             <button onclick="deleteMyAccount()" style="background:#f44336; margin-bottom:8px;">계정 탈퇴</button>
             <button onclick="closeMyPage()" style="background:#ccc; color:#333;">닫기</button>
+        </div>
+    </div>
+
+    <!-- 문의/건의 -->
+    <div id="feedbackModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.55); z-index: 1100; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 14px; padding: 26px; width: 92%; max-width: 420px; box-shadow: 0 10px 40px rgba(0,0,0,0.25);">
+            <h2 style="margin-bottom: 6px;">💬 문의 / 건의</h2>
+            <p style="color:#666; font-size:13px; margin-bottom:14px;">불편한 점이나 있으면 좋을 기능을 자유롭게 적어주세요. 개발자가 확인해요 🙌</p>
+            <select id="fb-category" style="margin-bottom:8px;">
+                <option value="건의">💡 이런 기능 있으면 좋겠어요</option>
+                <option value="불편">🐛 불편해요 / 오류</option>
+                <option value="기타">💬 기타</option>
+            </select>
+            <textarea id="fb-message" placeholder="내용을 적어주세요..." style="width:100%; min-height:110px; padding:10px; border:1px solid #ddd; border-radius:6px; font-size:14px; font-family:inherit; resize:vertical;"></textarea>
+            <button onclick="submitFeedback()" style="margin-top:12px;">보내기</button>
+            <button onclick="closeFeedback()" style="margin-top:8px; background:#ccc; color:#333;">닫기</button>
+        </div>
+    </div>
+
+    <!-- 관리자 대시보드 -->
+    <div id="adminModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.55); z-index: 1100; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 14px; padding: 24px; width: 94%; max-width: 480px; max-height: 90vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.25);">
+            <h2 style="margin-bottom: 14px;">🛠 관리자</h2>
+            <div id="admin-stats"></div>
+            <div style="font-weight:700; margin:18px 0 8px;">👥 사용자</div>
+            <div id="admin-users" style="max-height:220px; overflow-y:auto; font-size:13px;"></div>
+            <div style="font-weight:700; margin:18px 0 8px;">💬 문의/건의</div>
+            <div id="admin-feedback" style="max-height:260px; overflow-y:auto;"></div>
+            <button onclick="closeAdmin()" style="margin-top:16px; background:#ccc; color:#333;">닫기</button>
         </div>
     </div>
 
@@ -2933,7 +2976,56 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         }
         const mp = document.getElementById('mypage-pic');
         if (mp) mp.src = data.profile_pic || '/static/logo-cat.png';
+        // 관리자면 관리자 버튼 표시
+        if (data.is_admin) {
+            document.querySelectorAll('.admin-only').forEach(el => { el.style.display = ''; });
+        }
     }
+
+    // ── 문의/건의 ──
+    function openFeedback() { document.getElementById('fb-message').value = ''; document.getElementById('feedbackModal').style.display = 'flex'; }
+    function closeFeedback() { document.getElementById('feedbackModal').style.display = 'none'; }
+    async function submitFeedback() {
+        const msg = document.getElementById('fb-message').value.trim();
+        const cat = document.getElementById('fb-category').value;
+        if (!msg) { showToast('내용을 입력해주세요', 'error'); return; }
+        const form = new FormData(); form.append('message', msg); form.append('category', cat);
+        const res = await fetch('/api/feedback', {method: 'POST', body: form});
+        const data = await res.json();
+        if (data.status === 'success') { closeFeedback(); showToast('보냈어요. 고마워요! 🙌', 'success'); }
+        else showToast(data.error || '전송 실패', 'error');
+    }
+
+    // ── 관리자 대시보드 ──
+    async function openAdmin() {
+        document.getElementById('adminModal').style.display = 'flex';
+        document.getElementById('admin-stats').innerHTML = '<div style="color:#999;">불러오는 중...</div>';
+        document.getElementById('admin-users').innerHTML = '';
+        document.getElementById('admin-feedback').innerHTML = '';
+        try {
+            const [sRes, fRes] = await Promise.all([fetch('/api/admin/stats'), fetch('/api/admin/feedback')]);
+            if (!sRes.ok) { document.getElementById('admin-stats').innerHTML = '<div style="color:#f44336;">권한이 없어요.</div>'; return; }
+            const s = await sRes.json();
+            const f = await fRes.json();
+            document.getElementById('admin-stats').innerHTML =
+                '<div class="stat-item"><span>총 가입자</span><b>' + s.total_users + '명</b></div>' +
+                '<div class="stat-item"><span>최근 7일 접속</span><b>' + s.active_7d + '명</b></div>' +
+                '<div class="stat-item"><span>실제 사용중(내역 있음)</span><b>' + s.users_with_data + '명</b></div>' +
+                '<div class="stat-item"><span>총 내역 수</span><b>' + s.total_tx + '건</b></div>' +
+                '<div class="stat-item"><span>문의/건의</span><b>' + s.feedback_count + '건</b></div>';
+            document.getElementById('admin-users').innerHTML = (s.users || []).map(u =>
+                '<div class="stat-item"><span>' + escapeHtml(u.nickname || '') + ' <span style="color:#aaa; font-size:11px;">가입 ' + u.created_at + '</span></span>' +
+                '<span style="font-size:12px; color:#666;">내역 ' + u.tx + ' · 접속 ' + (u.last_login || '-') + '</span></div>'
+            ).join('') || '<div style="color:#999;">없음</div>';
+            document.getElementById('admin-feedback').innerHTML = (f.items || []).map(x =>
+                '<div style="border-bottom:1px solid #eee; padding:8px 0;">' +
+                    '<div style="font-size:12px; color:#888;">' + escapeHtml(x.nickname || '') + ' · ' + escapeHtml(x.category || '') + ' · ' + x.created_at + '</div>' +
+                    '<div style="font-size:14px; white-space:pre-wrap; word-break:break-word;">' + escapeHtml(x.message || '') + '</div>' +
+                '</div>'
+            ).join('') || '<div style="color:#999;">아직 문의가 없어요.</div>';
+        } catch (e) { document.getElementById('admin-stats').innerHTML = '<div style="color:#f44336;">불러오기 실패</div>'; }
+    }
+    function closeAdmin() { document.getElementById('adminModal').style.display = 'none'; }
 
     // ── 마이페이지 ──
     const PRESET_AVATARS = ['/static/avatar1.png', '/static/avatar2.png', '/static/avatar3.png', '/static/avatar4.png', '/static/avatar5.png'];
@@ -3172,6 +3264,7 @@ async def get_me(session: Optional[str] = Cookie(None)):
         "profile_pic": user.get("profile_pic", ""),
         "onboarded": onboarded,
         "accounts": accounts,
+        "is_admin": is_admin(user),
     }
 
 @app.post("/api/onboard/complete")
@@ -3245,6 +3338,71 @@ async def set_preset_pic(url: str = Form(...), session: Optional[str] = Cookie(N
         return JSONResponse({"error": "잘못된 이미지입니다"}, status_code=400)
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"profile_pic": url}})
     return {"status": "success", "profile_pic": url}
+
+# ── 문의/건의 (사용자 제출 · 관리자 열람) ──────────────
+@app.post("/api/feedback")
+async def submit_feedback(message: str = Form(...), category: str = Form(""), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    message = message.strip()
+    if not message:
+        return JSONResponse({"error": "내용을 입력해주세요"}, status_code=400)
+    await db.feedback.insert_one({
+        "user_id": user["_id"],
+        "nickname": user.get("username"),
+        "category": (category or "").strip(),
+        "message": message[:2000],
+        "created_at": datetime.now().isoformat(),
+    })
+    return {"status": "success"}
+
+@app.get("/api/admin/stats")
+async def admin_stats(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user or not is_admin(user):
+        return JSONResponse({"error": "권한 없음"}, status_code=403)
+    total_users = await db.users.count_documents({})
+    total_tx = await db.expenses.count_documents({})
+    users_with_data = len(await db.expenses.distinct("user_id"))
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    active_7d = await db.users.count_documents({"last_login": {"$gte": week_ago}})
+    feedback_count = await db.feedback.count_documents({})
+    # 유저별 내역 수
+    counts = {}
+    async for row in db.expenses.aggregate([{"$group": {"_id": "$user_id", "n": {"$sum": 1}}}]):
+        counts[row["_id"]] = row["n"]
+    users = []
+    async for u in db.users.find({}).sort("created_at", -1).limit(100):
+        users.append({
+            "nickname": u.get("username"),
+            "created_at": (u.get("created_at") or "")[:10],
+            "last_login": (u.get("last_login") or "")[:16].replace("T", " "),
+            "tx": counts.get(u["_id"], 0),
+        })
+    return {
+        "total_users": total_users,
+        "total_tx": total_tx,
+        "users_with_data": users_with_data,
+        "active_7d": active_7d,
+        "feedback_count": feedback_count,
+        "users": users,
+    }
+
+@app.get("/api/admin/feedback")
+async def admin_feedback(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user or not is_admin(user):
+        return JSONResponse({"error": "권한 없음"}, status_code=403)
+    items = []
+    async for f in db.feedback.find({}).sort("created_at", -1).limit(300):
+        items.append({
+            "nickname": f.get("nickname", ""),
+            "category": f.get("category", ""),
+            "message": f.get("message", ""),
+            "created_at": (f.get("created_at") or "")[:16].replace("T", " "),
+        })
+    return {"items": items}
 
 @app.post("/api/profile/delete")
 async def delete_account_user(session: Optional[str] = Cookie(None)):
