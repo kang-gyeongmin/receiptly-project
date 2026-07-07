@@ -101,6 +101,7 @@ except Exception as e:
 
 # 기본 카테고리
 DEFAULT_CATEGORIES = ["카페", "식사", "데이트", "고정지출"]
+DEFAULT_ACCOUNTS = ["현금"]
 
 # ── 유틸 함수 ─────────────────────────────────────
 def validate_password(password: str) -> tuple[bool, str]:
@@ -520,6 +521,7 @@ async def signup(username: str = Form(...), password: str = Form(...), password2
         "username": username,
         "password": hash_password(password),
         "categories": DEFAULT_CATEGORIES,
+        "accounts": DEFAULT_ACCOUNTS,
         "created_at": datetime.now().isoformat()
     }
     result = await db.users.insert_one(user)
@@ -568,7 +570,7 @@ async def home(session: Optional[str] = Cookie(None)):
 
 # ── 데이터 저장 ────────────────────────────────────
 @app.post("/add/expense")
-async def add_expense(date: str = Form(...), store: str = Form(...), amount: int = Form(...), category: str = Form(...), kind: str = Form("expense"), session: Optional[str] = Cookie(None)):
+async def add_expense(date: str = Form(...), store: str = Form(...), amount: int = Form(...), category: str = Form(...), kind: str = Form("expense"), account: str = Form(""), session: Optional[str] = Cookie(None)):
     user = await get_current_user(session)
     if not user:
         return JSONResponse({"error": "로그인 필요"}, status_code=401)
@@ -583,6 +585,7 @@ async def add_expense(date: str = Form(...), store: str = Form(...), amount: int
         "amount": amount,
         "category": category,
         "kind": kind,  # "expense" | "income"
+        "account": account.strip(),  # 계좌/카드 (예: 카카오뱅크, 현금)
         "created_at": datetime.now().isoformat()
     }
     await db.expenses.insert_one(doc)
@@ -695,8 +698,8 @@ def get_period_range(period: str, offset: int = 0) -> tuple[str, str, str]:
     return f"{year}-{month:02d}-01", f"{year}-{month:02d}-{last_day:02d}", f"{year}년 {month}월"
 
 @app.get("/api/analysis")
-async def get_analysis(period: str = "month", offset: int = 0, session: Optional[str] = Cookie(None)):
-    """기간별(month/week/year) 카테고리 집계 + 지출 목록. offset으로 이전/다음 기간 이동."""
+async def get_analysis(period: str = "month", offset: int = 0, account: str = "", session: Optional[str] = Cookie(None)):
+    """기간별(month/week/year) 집계 + 목록. offset=기간이동, account=계좌 필터(빈값=전체)."""
     user = await get_current_user(session)
     if not user:
         return JSONResponse({"error": "로그인 필요"}, status_code=401)
@@ -705,9 +708,11 @@ async def get_analysis(period: str = "month", offset: int = 0, session: Optional
         period = "month"
 
     start, end, label = get_period_range(period, offset)
+    account = (account or "").strip()
 
     expenses = []
     category_totals = {}   # 지출 카테고리별
+    account_totals = {}    # 계좌별 {acc: {income, expense}}
     expense_total = 0
     income_total = 0
     async for doc in db.expenses.find({
@@ -716,9 +721,21 @@ async def get_analysis(period: str = "month", offset: int = 0, session: Optional
     }).sort("date", -1):
         doc["_id"] = str(doc["_id"])
         doc.pop("user_id", None)  # ObjectId는 JSON 직렬화 불가 + 프론트 미사용
-        expenses.append(doc)
+        acc = doc.get("account", "") or "(미지정)"
         amount = doc.get("amount", 0)
-        if doc.get("kind") == "income":
+        is_income = doc.get("kind") == "income"
+
+        # 계좌별 합계는 필터와 무관하게 전체로 집계 (계좌 비교용)
+        if acc not in account_totals:
+            account_totals[acc] = {"income": 0, "expense": 0}
+        account_totals[acc]["income" if is_income else "expense"] += amount
+
+        # 계좌 필터 적용
+        if account and acc != account:
+            continue
+
+        expenses.append(doc)
+        if is_income:
             income_total += amount
         else:  # 기본: 지출 (기존 데이터에 kind 없으면 지출로 간주)
             expense_total += amount
@@ -727,8 +744,12 @@ async def get_analysis(period: str = "month", offset: int = 0, session: Optional
 
     by_category = sorted(
         [{"category": c, "amount": a} for c, a in category_totals.items()],
-        key=lambda x: x["amount"],
-        reverse=True
+        key=lambda x: x["amount"], reverse=True
+    )
+    by_account = sorted(
+        [{"account": a, "income": v["income"], "expense": v["expense"], "net": v["income"] - v["expense"]}
+         for a, v in account_totals.items()],
+        key=lambda x: x["income"] + x["expense"], reverse=True
     )
 
     return {
@@ -737,11 +758,13 @@ async def get_analysis(period: str = "month", offset: int = 0, session: Optional
         "label": label,
         "start": start,
         "end": end,
+        "account": account,
         "total": expense_total,        # 하위호환: 기존 total = 지출 합계
         "expense_total": expense_total,
         "income_total": income_total,
         "net": income_total - expense_total,
         "by_category": by_category,
+        "by_account": by_account,
         "expenses": expenses
     }
 
@@ -1395,11 +1418,18 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                     <button onclick="setPeriod('year')">연별</button>
                 </div>
 
-                <div class="period-nav" style="display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 20px;">
+                <div class="period-nav" style="display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 12px;">
                     <button onclick="movePeriod(-1)" style="width: auto; padding: 8px 16px; margin: 0;">←</button>
                     <span id="period-label" style="font-weight: 600; font-size: 16px; min-width: 180px; text-align: center;"></span>
                     <button onclick="movePeriod(1)" style="width: auto; padding: 8px 16px; margin: 0;">→</button>
                 </div>
+
+                <div style="display:flex; align-items:center; gap:8px; margin-bottom:16px;">
+                    <span style="font-size:13px; color:#666;">🏦 계좌</span>
+                    <select id="account-filter" onchange="loadAnalysis()" style="flex:1; margin:0; padding:8px;"></select>
+                </div>
+
+                <div class="stats" id="account-summary" style="margin-bottom:16px;"></div>
 
                 <div class="stats" id="analysis-stats">
                     <h4>카테고리별 지출</h4>
@@ -1470,6 +1500,10 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 </select>
                 <button onclick="openCategoryModal()" style="width: 40px; padding: 10px; margin: 8px 0;">⚙️</button>
             </div>
+            <div style="display: flex; gap: 5px;">
+                <select id="account" style="flex: 1;"></select>
+                <button onclick="openAccountModal()" title="계좌 관리" style="width: 40px; padding: 10px; margin: 8px 0;">🏦</button>
+            </div>
             <button onclick="addExpense()">저장</button>
 
             <hr class="desktop-only" />
@@ -1515,6 +1549,23 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- 계좌 관리 모달 -->
+    <div id="accountModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 12px; padding: 30px; width: 90%; max-width: 400px; box-shadow: 0 10px 40px rgba(0,0,0,0.2);">
+            <h2>🏦 계좌/카드 관리</h2>
+            <div style="margin: 20px 0;">
+                <h4 style="margin-bottom: 10px;">내 계좌/카드</h4>
+                <div id="accountList" style="max-height: 250px; overflow-y: auto;"></div>
+            </div>
+            <h4 style="margin-top: 20px; margin-bottom: 10px;">새 계좌/카드 추가</h4>
+            <div style="display: flex; gap: 5px;">
+                <input type="text" id="newAccountName" placeholder="예: 카카오뱅크, 신한체크" style="flex: 1;" />
+                <button onclick="addNewAccount()" style="width: 60px;">추가</button>
+            </div>
+            <button onclick="closeAccountModal()" style="margin-top: 20px; background: #999;">닫기</button>
+        </div>
+    </div>
+
     <script>
     let currentMonth = new Date();
     let selectedDate = null;
@@ -1522,6 +1573,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     let dateExpenses = [];          // 선택된 날짜의 지출 목록
     let editingExpenseIndex = null; // 인라인 수정 중인 항목 인덱스
     let userCategories = [];        // 사용자 카테고리 (수정/추가 드롭다운용)
+    let userAccounts = [];          // 사용자 계좌/카드
 
     // 비차단 토스트 (탭을 멈추는 alert 대체). type: '' | 'success' | 'error'
     function showToast(message, type = '') {
@@ -2019,8 +2071,11 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const tableBody = document.getElementById('expense-table');
         const labelEl = document.getElementById('period-label');
 
+        const acctFilter = document.getElementById('account-filter');
+        const selectedAcct = acctFilter ? acctFilter.value : '';
+
         try {
-            const response = await fetch('/api/analysis?period=' + currentPeriod + '&offset=' + periodOffset);
+            const response = await fetch('/api/analysis?period=' + currentPeriod + '&offset=' + periodOffset + '&account=' + encodeURIComponent(selectedAcct));
             if (!response.ok) {
                 throw new Error('API 응답 실패: ' + response.status);
             }
@@ -2032,6 +2087,32 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
             // 기간 라벨 표시 (예: 2026년 7월, 6월 29일 ~ 7월 5일)
             if (labelEl) labelEl.textContent = periodLabel;
+
+            // 계좌 필터 옵션 채우기 (선택 유지)
+            if (acctFilter) {
+                const cur = acctFilter.value;
+                let opts = '<option value="">전체 계좌</option>';
+                (userAccounts || []).forEach(a => { opts += '<option value="' + escapeHtml(a) + '">' + escapeHtml(a) + '</option>'; });
+                acctFilter.innerHTML = opts;
+                acctFilter.value = cur;
+            }
+
+            // 계좌별 수입/지출/순액 요약
+            const byAccount = data.by_account || [];
+            const accDiv = document.getElementById('account-summary');
+            if (accDiv) {
+                if (byAccount.length <= 1 && !selectedAcct) {
+                    accDiv.innerHTML = '';  // 계좌 하나뿐이면 생략
+                } else {
+                    let ah = '<h4>계좌별</h4>';
+                    byAccount.forEach(a => {
+                        const net = a.net;
+                        ah += '<div class="stat-item"><span class="category">' + escapeHtml(a.account) + '</span>' +
+                              '<span style="font-size:12px;"><span style="color:#2e7d32;">+' + a.income.toLocaleString() + '</span> / <span style="color:#4A90D9;">-' + a.expense.toLocaleString() + '</span> = <b style="color:' + (net >= 0 ? '#2e7d32' : '#f44336') + ';">' + (net >= 0 ? '+' : '') + net.toLocaleString() + '</b></span></div>';
+                    });
+                    accDiv.innerHTML = ah;
+                }
+            }
 
             // 수입/지출/순수지 요약 + 카테고리별 지출
             const incomeTotal = data.income_total || 0;
@@ -2084,6 +2165,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const amount = document.getElementById('amount').value;
         const date = document.getElementById('date').value;
         const category = document.getElementById('category').value;
+        const account = document.getElementById('account').value;
 
         if (!store || !amount || !date) {
             showToast('모든 항목을 입력해주세요', 'error');
@@ -2096,6 +2178,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         form.append('amount', parseInt(amount));
         form.append('category', category);
         form.append('kind', inputKind);
+        form.append('account', account);
 
         try {
             const response = await fetch('/add/expense', {method: 'POST', body: form});
@@ -2259,6 +2342,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                     '<input id="' + id + '-newcat" placeholder="새 카테고리 추가" style="flex:1; margin:0; padding:6px; font-size:12px;" />' +
                     '<button onclick="addCatFromCard(' + n + ')" style="width:auto; margin:0; padding:6px 10px; font-size:12px; background:#4CAF50;">+</button>' +
                 '</div>' +
+                '<label style="' + labelStyle + '">🏦 계좌</label>' +
+                '<select id="' + id + '-acc" style="' + inputStyle + '">' + accOptions(expense.account) + '</select>' +
                 '<div style="display:flex; gap:5px; margin-top:8px;">' +
                     '<button onclick="confirmSave(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px;">저장</button>' +
                     '<button onclick="cancelSave(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px; background:#999;">취소</button>' +
@@ -2302,6 +2387,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const amount = document.getElementById(id + '-amount').value;
         const category = document.getElementById(id + '-cat').value;
         const kind = document.getElementById(id + '-kind').value;
+        const account = document.getElementById(id + '-acc').value;
 
         if (!date || !store || !amount) { showToast('날짜·가게·금액을 입력해주세요', 'error'); return; }
         if (parseInt(amount) <= 0) { showToast('금액은 1원 이상이어야 합니다', 'error'); return; }
@@ -2311,6 +2397,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         form.append('store', store);
         form.append('amount', parseInt(amount));
         form.append('category', category);
+        form.append('account', account);
         form.append('kind', kind);
 
         try {
@@ -2373,6 +2460,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 '<input type="number" id="' + id + '-amount" value="' + Number(e.amount) + '" style="' + inputStyle + '" />' +
                 '<label style="' + labelStyle + '">🏷️ 카테고리</label>' +
                 '<select id="' + id + '-cat" style="' + inputStyle + '">' + catOptions(e.category) + '</select>' +
+                '<label style="' + labelStyle + '">🏦 계좌</label>' +
+                '<select id="' + id + '-acc" style="' + inputStyle + '">' + accOptions(userAccounts[0]) + '</select>' +
                 '<div style="display:flex; gap:5px; margin-top:8px;">' +
                     '<button onclick="confirmSaveMulti(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px;">' + data.dates.length + '건 저장</button>' +
                     '<button onclick="cancelMulti(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px; background:#999;">취소</button>' +
@@ -2391,6 +2480,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const amount = document.getElementById(id + '-amount').value;
         const category = document.getElementById(id + '-cat').value;
         const kind = document.getElementById(id + '-kind').value;
+        const account = document.getElementById(id + '-acc').value;
         if (!store || !amount) { showToast('가게/내용과 금액을 입력해주세요', 'error'); return; }
         if (parseInt(amount) <= 0) { showToast('금액은 1원 이상이어야 합니다', 'error'); return; }
 
@@ -2402,6 +2492,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             form.append('amount', parseInt(amount));
             form.append('category', category);
             form.append('kind', kind);
+            form.append('account', account);
             try {
                 const res = await fetch('/add/expense', {method: 'POST', body: form});
                 const result = await res.json();
@@ -2458,6 +2549,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         messages.innerHTML +=
             '<div class="chat-message bot" id="cl' + n + '" style="text-align:left;">' +
                 '<div style="font-weight:600; margin-bottom:6px;">' + items.length + '건을 읽었어요 <span style="font-weight:400; color:#888; font-size:12px;">(수정/✕삭제 후 저장)</span></div>' +
+                '<div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;"><span style="font-size:12px; color:#666;">🏦 계좌</span>' +
+                    '<select id="cl' + n + '_acc" style="flex:1; margin:0; padding:5px; font-size:12px;">' + accOptions(userAccounts[0]) + '</select></div>' +
                 '<div style="max-height:280px; overflow-y:auto; overscroll-behavior:contain;">' + rows + '</div>' +
                 '<div style="display:flex; gap:5px; margin-top:8px;">' +
                     '<button onclick="confirmSaveList(' + n + ')" style="flex:1; margin:0; padding:8px; font-size:13px;">저장</button>' +
@@ -2475,6 +2568,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     async function confirmSaveList(n) {
         const items = pendingLists[n];
         if (!items) return;
+        const accEl = document.getElementById('cl' + n + '_acc');
+        const account = accEl ? accEl.value : '';
         let ok = 0;
         for (let i = 0; i < items.length; i++) {
             const row = document.getElementById('row-' + n + '-' + i);
@@ -2489,6 +2584,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             form.append('amount', parseInt(amount));
             form.append('category', items[i].category || (userCategories[0] || '기타'));
             form.append('kind', kind);
+            form.append('account', account);
             try {
                 const res = await fetch('/add/expense', {method: 'POST', body: form});
                 const r = await res.json();
@@ -2673,9 +2769,80 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         }
     }
 
+    // 계좌 관리 함수들
+    let accModalList = [];
+    async function loadAccounts() {
+        try {
+            const res = await fetch('/api/accounts');
+            const data = await res.json();
+            if (data.accounts) {
+                userAccounts = data.accounts;
+                updateAccountOptions(data.accounts);
+                if (document.getElementById('accountList')) renderAccountList(data.accounts);
+            }
+        } catch (e) { console.log('계좌 로드 오류:', e); }
+    }
+    function updateAccountOptions(accounts) {
+        const sel = document.getElementById('account');
+        if (!sel) return;
+        sel.innerHTML = '';
+        accounts.forEach(a => { const o = document.createElement('option'); o.textContent = a; sel.appendChild(o); });
+    }
+    function accOptions(selected) {
+        let accs = userAccounts.slice();
+        if (selected && accs.indexOf(selected) === -1) accs = [selected].concat(accs);
+        return accs.map(a => '<option value="' + escapeHtml(a) + '"' + (a === selected ? ' selected' : '') + '>' + escapeHtml(a) + '</option>').join('');
+    }
+    function renderAccountList(accounts) {
+        accModalList = accounts;
+        const list = document.getElementById('accountList');
+        if (!list) return;
+        list.innerHTML = accounts.map((a, idx) =>
+            '<div style="display:flex; justify-content:space-between; align-items:center; padding:10px; background:#f9f9f9; border-radius:6px; margin-bottom:8px;">' +
+                '<span style="flex:1;">' + escapeHtml(a) + '</span>' +
+                '<button onclick="deleteAccount(' + idx + ')" style="padding:5px 10px; width:auto; background:#f44336; font-size:12px;">삭제</button>' +
+            '</div>'
+        ).join('') || '<div style="color:#999; font-size:13px;">계좌가 없어요. 추가해보세요.</div>';
+    }
+    function openAccountModal() {
+        const m = document.getElementById('accountModal');
+        m.style.display = 'flex';
+        loadAccounts();
+        setTimeout(() => { const el = document.getElementById('newAccountName'); if (el) el.focus(); }, 100);
+    }
+    function closeAccountModal() { document.getElementById('accountModal').style.display = 'none'; }
+    async function addNewAccount() {
+        const name = document.getElementById('newAccountName').value.trim();
+        if (!name) { showToast('계좌명을 입력해주세요', 'error'); return; }
+        const form = new FormData(); form.append('name', name);
+        const res = await fetch('/api/accounts/add', {method: 'POST', body: form});
+        const data = await res.json();
+        if (data.status === 'success') {
+            document.getElementById('newAccountName').value = '';
+            userAccounts = data.accounts;
+            renderAccountList(data.accounts); updateAccountOptions(data.accounts);
+        } else showToast(data.error || '오류가 발생했습니다', 'error');
+    }
+    async function deleteAccount(idx) {
+        const name = accModalList[idx];
+        if (name === undefined) return;
+        const form = new FormData(); form.append('name', name);
+        const res = await fetch('/api/accounts/delete', {method: 'POST', body: form});
+        const data = await res.json();
+        if (data.status === 'success') {
+            userAccounts = data.accounts;
+            renderAccountList(data.accounts); updateAccountOptions(data.accounts);
+        } else showToast(data.error || '오류가 발생했습니다', 'error');
+    }
+    document.addEventListener('DOMContentLoaded', function() {
+        const m = document.getElementById('accountModal');
+        if (m) m.addEventListener('click', function(e) { if (e.target === m) closeAccountModal(); });
+    });
+
     document.getElementById('date').valueAsDate = new Date();
     loadExpensesAndRender();
     loadCategories();
+    loadAccounts();
     </script>
 </body>
 </html>"""
@@ -2751,6 +2918,58 @@ async def rename_category(old_name: str = Form(...), new_name: str = Form(...), 
         {"$set": {"categories": categories}}
     )
     return {"status": "success", "categories": categories}
+
+# ── 계좌(은행/카드) 관리 API ────────────────────────
+@app.get("/api/accounts")
+async def get_accounts(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    return {"accounts": user.get("accounts", DEFAULT_ACCOUNTS)}
+
+@app.post("/api/accounts/add")
+async def add_account(name: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    name = name.strip()
+    if not name:
+        return JSONResponse({"error": "계좌명을 입력해주세요"}, status_code=400)
+    accounts = user.get("accounts", DEFAULT_ACCOUNTS)
+    if name in accounts:
+        return JSONResponse({"error": "이미 존재하는 계좌입니다"}, status_code=400)
+    accounts.append(name)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"accounts": accounts}})
+    return {"status": "success", "accounts": accounts}
+
+@app.post("/api/accounts/delete")
+async def delete_account(name: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    accounts = user.get("accounts", DEFAULT_ACCOUNTS)
+    if name not in accounts:
+        return JSONResponse({"error": "존재하지 않는 계좌입니다"}, status_code=400)
+    accounts.remove(name)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"accounts": accounts}})
+    return {"status": "success", "accounts": accounts}
+
+@app.post("/api/accounts/rename")
+async def rename_account(old_name: str = Form(...), new_name: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    new_name = new_name.strip()
+    accounts = user.get("accounts", DEFAULT_ACCOUNTS)
+    if old_name not in accounts:
+        return JSONResponse({"error": "존재하지 않는 계좌입니다"}, status_code=400)
+    if not new_name or new_name in accounts:
+        return JSONResponse({"error": "잘못된 계좌명입니다"}, status_code=400)
+    accounts[accounts.index(old_name)] = new_name
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"accounts": accounts}})
+    # 기존 내역의 계좌명도 함께 변경
+    await db.expenses.update_many({"user_id": user["_id"], "account": old_name}, {"$set": {"account": new_name}})
+    return {"status": "success", "accounts": accounts}
 
 # ── 위시리스트 API ─────────────────────────────────
 def _coupang_search_url(name: str) -> str:
