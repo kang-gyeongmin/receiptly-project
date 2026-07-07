@@ -206,6 +206,45 @@ def extract_text_from_image(image_bytes: bytes) -> str:
         print(f"OCR 오류: {e}")
         return ""
 
+def extract_text_lines(image_bytes: bytes) -> str:
+    """OCR 결과를 '시각적 줄'로 재구성(같은 y끼리 묶고 x로 정렬) → 줄바꿈 텍스트.
+    통장/영수증처럼 표 형태에서 잔액 줄이 금액 줄과 분리됨."""
+    if reader is None:
+        return ""
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        image = preprocess_image(image)
+        results = reader.readtext(np.array(image), detail=1)
+        toks = []
+        for box, text, conf in results:
+            if conf < 0.3 or not text.strip():
+                continue
+            ys = [p[1] for p in box]
+            xs = [p[0] for p in box]
+            toks.append((min(ys), min(xs), max(ys) - min(ys), text.strip()))
+        if not toks:
+            return ""
+        toks.sort(key=lambda t: (t[0], t[1]))
+        heights = sorted(t[2] for t in toks)
+        thr = max(8, heights[len(heights) // 2] * 0.6)  # 줄 구분 임계값(글자높이 기반)
+        lines = []
+        cur = []
+        prev_y = None
+        for y, x, h, text in toks:
+            if prev_y is not None and (y - prev_y) > thr:
+                cur.sort(key=lambda p: p[0])
+                lines.append(" ".join(t for _, t in cur))
+                cur = []
+            cur.append((x, text))
+            prev_y = y
+        if cur:
+            cur.sort(key=lambda p: p[0])
+            lines.append(" ".join(t for _, t in cur))
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"OCR(lines) 오류: {e}")
+        return ""
+
 # 영수증/결제내역 OCR 텍스트에서 지출 정보 추출 (best-effort, 확인 카드로 교정 전제)
 RECEIPT_STOPWORDS = [
     "승인", "금액", "합계", "카드", "일시불", "할부", "매출", "가맹점", "결제", "부가세",
@@ -259,17 +298,18 @@ _TXN_INCOME_KWS = ["급여", "월급", "이자", "입금", "혜택", "받기", "
 def extract_transactions_from_ocr(text: str) -> list:
     today = datetime.now()
     txns = []
-    for m in re.finditer(r'(\d{1,2})[.\-/](\d{1,2})\s+(.+?)\s*(-?\d[\d,]*)\s*원', text):
+    for m in re.finditer(r'(\d{1,2})[.\-/](\d{1,2})[ \t]+(.+?)[ \t]*(-?\d[\d,]*)[ \t]*원', text):
         mo, d = int(m.group(1)), int(m.group(2))
         if not (1 <= mo <= 12 and 1 <= d <= 31):
             continue
-        desc = re.sub(r'\s+', ' ', m.group(3)).strip(" .,-·|")
+        desc = re.sub(r'\s+', ' ', m.group(3)).strip(" .,-·|~−–—")
         raw = m.group(4).strip()
         amount = int(raw.replace(',', '').replace('-', '') or 0)
         if amount <= 0 or not desc:
             continue
-        # 부호(-)=지출, 없으면 수입키워드/기본=수입 (통장 기준). 확인 리스트에서 수정 가능
-        if raw.startswith('-'):
+        # 부호(-/~/−)=지출, 수입키워드=수입, 그 외 기본 지출. 확인 리스트에서 수정 가능
+        tail = m.group(3).rstrip()[-1:]  # 설명 끝이 마이너스류면 지출
+        if raw.startswith('-') or tail in "-~−–—":
             kind = "expense"
         elif any(k in desc for k in _TXN_INCOME_KWS):
             kind = "income"
@@ -889,7 +929,7 @@ async def chat_image(file: UploadFile = File(...), session: Optional[str] = Cook
         return {"type": "message", "response": "OCR이 준비되지 않았어요. 서버 로그를 확인해주세요."}
 
     image_bytes = await file.read()
-    text = extract_text_from_image(image_bytes)
+    text = extract_text_lines(image_bytes)  # 줄 재구성 (표 형태 대응)
     if not text:
         return {"type": "message", "response": "사진에서 글자를 읽지 못했어요. 더 밝고 선명한 사진으로 다시 시도해주세요."}
 
