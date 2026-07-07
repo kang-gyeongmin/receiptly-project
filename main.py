@@ -1490,7 +1490,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const container = document.querySelector('.container');
         if (container) container.style.gridTemplateColumns = isCalendar ? '' : '1fr';
         const cs = document.getElementById('chat-section');
-        if (cs) cs.classList.remove('open');            // 탭 이동 시 챗봇 닫기
+        if (cs && cs.classList.contains('open')) toggleChat(false);  // 탭 이동 시 챗봇 닫고 배경 잠금 해제
         const mm = document.getElementById('mobile-menu');
         if (mm) mm.style.display = 'none';              // 메뉴 닫기
 
@@ -1506,16 +1506,30 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     function mobileNav(tab) {
         switchTab(tab);
     }
+    let chatScrollY = 0;
     function toggleChat(open) {
         const s = document.getElementById('chat-section');
         if (!s) return;
         if (open === undefined) open = !s.classList.contains('open');
         s.classList.toggle('open', open);
-        // 챗봇 열면 뒤 배경 스크롤 잠금
-        document.body.style.overflow = open ? 'hidden' : '';
+        const body = document.body;
         if (open) {
+            // 뒤 배경 스크롤 완전 잠금 (iOS 대응: position fixed)
+            chatScrollY = window.scrollY || window.pageYOffset || 0;
+            body.style.position = 'fixed';
+            body.style.top = '-' + chatScrollY + 'px';
+            body.style.left = '0';
+            body.style.right = '0';
+            body.style.width = '100%';
             const m = document.getElementById('messages');
             if (m) m.scrollTop = m.scrollHeight;  // 최신 대화로
+        } else {
+            body.style.position = '';
+            body.style.top = '';
+            body.style.left = '';
+            body.style.right = '';
+            body.style.width = '';
+            window.scrollTo(0, chatScrollY);
         }
     }
 
