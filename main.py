@@ -1773,6 +1773,15 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         loadExpensesAndRender();
     }
 
+    // 달력 칸용 금액 축약: 1만 이상은 '만' 단위(예: 166,820 → 16.7만), 그 이하는 그대로
+    function fmtCalAmount(n) {
+        if (n >= 10000) {
+            const m = n / 10000;
+            return (m >= 100 ? Math.round(m) : Math.round(m * 10) / 10) + '만';
+        }
+        return n.toLocaleString();
+    }
+
     function renderCalendar() {
         const year = currentMonth.getFullYear();
         const month = currentMonth.getMonth();
@@ -1829,9 +1838,9 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 const isMobile = window.matchMedia('(max-width: 768px)').matches;
                 html += '<div style="font-size: 11px; margin-top: 4px;">';
                 if (isMobile) {
-                    // 모바일: 카테고리 없이 -지출/+수입 총액만
-                    if (expenseTotal > 0) html += '<div style="color: #e74c3c; margin-bottom: 2px;">-' + expenseTotal.toLocaleString() + '원</div>';
-                    if (incomeTotal > 0) html += '<div style="color: #2e7d32; margin-bottom: 2px;">+' + incomeTotal.toLocaleString() + '원</div>';
+                    // 모바일: 카테고리 없이 -지출/+수입 총액만 (한 줄씩, 큰 금액은 만 단위 축약)
+                    if (expenseTotal > 0) html += '<div style="color: #e74c3c; margin-bottom: 2px; white-space: nowrap; overflow: hidden;">-' + fmtCalAmount(expenseTotal) + '</div>';
+                    if (incomeTotal > 0) html += '<div style="color: #2e7d32; margin-bottom: 2px; white-space: nowrap; overflow: hidden;">+' + fmtCalAmount(incomeTotal) + '</div>';
                 } else {
                     // 데스크톱: 수입 + 카테고리별 지출
                     if (incomeTotal > 0) html += '<div style="color: #2e7d32; margin-bottom: 2px;">+' + incomeTotal.toLocaleString() + '원</div>';
