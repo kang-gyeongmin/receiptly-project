@@ -1758,30 +1758,45 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     function mobileNav(tab) {
         switchTab(tab);
     }
-    let chatScrollY = 0;
+    // 배경 스크롤 잠금 (iOS 대응: position fixed). 여러 오버레이가 겹쳐도 카운트로 관리
+    let scrollLockY = 0;
+    let scrollLockCount = 0;
+    function lockScroll() {
+        if (scrollLockCount === 0) {
+            scrollLockY = window.scrollY || window.pageYOffset || 0;
+            const b = document.body;
+            b.style.position = 'fixed';
+            b.style.top = '-' + scrollLockY + 'px';
+            b.style.left = '0';
+            b.style.right = '0';
+            b.style.width = '100%';
+        }
+        scrollLockCount++;
+    }
+    function unlockScroll() {
+        scrollLockCount = Math.max(0, scrollLockCount - 1);
+        if (scrollLockCount === 0) {
+            const b = document.body;
+            b.style.position = '';
+            b.style.top = '';
+            b.style.left = '';
+            b.style.right = '';
+            b.style.width = '';
+            window.scrollTo(0, scrollLockY);
+        }
+    }
     function toggleChat(open) {
         const s = document.getElementById('chat-section');
         if (!s) return;
-        if (open === undefined) open = !s.classList.contains('open');
+        const wasOpen = s.classList.contains('open');
+        if (open === undefined) open = !wasOpen;
         s.classList.toggle('open', open);
-        const body = document.body;
-        if (open) {
-            // 뒤 배경 스크롤 완전 잠금 (iOS 대응: position fixed)
-            chatScrollY = window.scrollY || window.pageYOffset || 0;
-            body.style.position = 'fixed';
-            body.style.top = '-' + chatScrollY + 'px';
-            body.style.left = '0';
-            body.style.right = '0';
-            body.style.width = '100%';
+        if (open && !wasOpen) {
+            lockScroll();
             const m = document.getElementById('messages');
             if (m) m.scrollTop = m.scrollHeight;  // 최신 대화로
-        } else {
-            body.style.position = '';
-            body.style.top = '';
-            body.style.left = '';
-            body.style.right = '';
-            body.style.width = '';
-            window.scrollTo(0, chatScrollY);
+        } else if (!open && wasOpen) {
+            unlockScroll();
         }
     }
 
@@ -2811,6 +2826,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         modal.style.display = 'flex';
         modal.style.justifyContent = 'center';
         modal.style.alignItems = 'center';
+        lockScroll();
         loadCategories();
         setTimeout(() => {
             document.getElementById('newCategoryName')?.focus();
@@ -2819,6 +2835,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
     function closeCategoryModal() {
         const modal = document.getElementById('categoryModal');
+        if (modal.style.display !== 'none') unlockScroll();
         modal.style.display = 'none';
     }
 
@@ -2921,10 +2938,11 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     function openAccountModal() {
         const m = document.getElementById('accountModal');
         m.style.display = 'flex';
+        lockScroll();
         loadAccounts();
         setTimeout(() => { const el = document.getElementById('newAccountName'); if (el) el.focus(); }, 100);
     }
-    function closeAccountModal() { document.getElementById('accountModal').style.display = 'none'; }
+    function closeAccountModal() { const m = document.getElementById('accountModal'); if (m.style.display !== 'none') unlockScroll(); m.style.display = 'none'; }
     async function addNewAccount() {
         const name = document.getElementById('newAccountName').value.trim();
         if (!name) { showToast('계좌명을 입력해주세요', 'error'); return; }
@@ -2983,8 +3001,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     }
 
     // ── 문의/건의 ──
-    function openFeedback() { document.getElementById('fb-message').value = ''; document.getElementById('feedbackModal').style.display = 'flex'; }
-    function closeFeedback() { document.getElementById('feedbackModal').style.display = 'none'; }
+    function openFeedback() { document.getElementById('fb-message').value = ''; document.getElementById('feedbackModal').style.display = 'flex'; lockScroll(); }
+    function closeFeedback() { document.getElementById('feedbackModal').style.display = 'none'; unlockScroll(); }
     async function submitFeedback() {
         const msg = document.getElementById('fb-message').value.trim();
         const cat = document.getElementById('fb-category').value;
@@ -2999,6 +3017,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     // ── 관리자 대시보드 ──
     async function openAdmin() {
         document.getElementById('adminModal').style.display = 'flex';
+        lockScroll();
         document.getElementById('admin-stats').innerHTML = '<div style="color:#999;">불러오는 중...</div>';
         document.getElementById('admin-users').innerHTML = '';
         document.getElementById('admin-feedback').innerHTML = '';
@@ -3025,7 +3044,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             ).join('') || '<div style="color:#999;">아직 문의가 없어요.</div>';
         } catch (e) { document.getElementById('admin-stats').innerHTML = '<div style="color:#f44336;">불러오기 실패</div>'; }
     }
-    function closeAdmin() { document.getElementById('adminModal').style.display = 'none'; }
+    function closeAdmin() { document.getElementById('adminModal').style.display = 'none'; unlockScroll(); }
 
     // ── 마이페이지 ──
     const PRESET_AVATARS = ['/static/avatar1.png', '/static/avatar2.png', '/static/avatar3.png', '/static/avatar4.png', '/static/avatar5.png'];
@@ -3038,6 +3057,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             '<img src="' + u + '" onclick="selectPreset(' + i + ')" style="width:48px; height:48px; border-radius:50%; cursor:pointer; border:2px solid #eee;" />'
         ).join('');
         document.getElementById('myPageModal').style.display = 'flex';
+        lockScroll();
     }
     async function selectPreset(i) {
         const url = PRESET_AVATARS[i];
@@ -3051,7 +3071,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             showToast('프로필 사진이 변경됐어요', 'success');
         } else showToast(data.error || '변경 실패', 'error');
     }
-    function closeMyPage() { document.getElementById('myPageModal').style.display = 'none'; }
+    function closeMyPage() { document.getElementById('myPageModal').style.display = 'none'; unlockScroll(); }
     async function saveNickname() {
         const v = document.getElementById('mypage-nick').value.trim();
         if (v.length < 2) { showToast('닉네임은 2자 이상이어야 해요', 'error'); return; }
@@ -3119,6 +3139,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         ).join('');
         renderOnboardList();
         document.getElementById('onboardModal').style.display = 'flex';
+        lockScroll();
     }
     async function onboardAddQuick(i) { await onboardAdd(COMMON_BANKS[i]); }
     async function onboardAddCustom() {
@@ -3165,6 +3186,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     async function onboardComplete() {
         try { await fetch('/api/onboard/complete', {method: 'POST'}); } catch (e) {}
         document.getElementById('onboardModal').style.display = 'none';
+        unlockScroll();
         loadAccounts();
     }
 
