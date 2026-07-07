@@ -52,22 +52,110 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ── PWA (홈 화면 설치용 manifest + 서비스워커) ──────────
 PWA_MANIFEST = {
+    "id": "/",
     "name": "Zik 가계부",
     "short_name": "Zik",
-    "description": "자연어·영수증으로 쉽게 쓰는 AI 가계부",
+    "description": "자연어·영수증으로 쉽게 쓰는 AI 가계부. 계좌별 관리, 위시리스트, 지하철 요금 조회까지.",
+    "lang": "ko",
+    "dir": "ltr",
     "start_url": "/",
+    "scope": "/",
     "display": "standalone",
+    "orientation": "portrait",
     "background_color": "#f5f5f5",
     "theme_color": "#4A90D9",
+    "categories": ["finance", "productivity"],
     "icons": [
-        {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
-        {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+        {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+        {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"},
+        {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+    ],
+    "screenshots": [
+        {"src": "/static/screenshot1.png", "sizes": "1080x1920", "type": "image/png", "form_factor": "narrow", "label": "달력으로 보는 수입·지출"},
+        {"src": "/static/screenshot2.png", "sizes": "1080x1920", "type": "image/png", "form_factor": "narrow", "label": "챗봇으로 간편 입력"},
     ],
 }
 
 @app.get("/manifest.json")
 async def manifest():
     return JSONResponse(PWA_MANIFEST)
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_page():
+    return PRIVACY_PAGE
+
+PRIVACY_PAGE = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Zik 개인정보처리방침</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: -apple-system, 'Segoe UI', sans-serif; max-width: 760px; margin: 0 auto; padding: 24px; color: #222; line-height: 1.7; background: #fff; }
+        h1 { font-size: 26px; }
+        h2 { font-size: 18px; margin-top: 28px; border-bottom: 2px solid #eee; padding-bottom: 6px; }
+        .muted { color: #777; font-size: 14px; }
+        ul { padding-left: 20px; }
+        a { color: #4A90D9; }
+        table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 14px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background: #f7f9fb; }
+    </style>
+</head>
+<body>
+    <h1>🧾 Zik 개인정보처리방침</h1>
+    <p class="muted">시행일: 2026년 7월 7일</p>
+    <p>Zik(이하 "서비스")은 이용자의 개인정보를 소중히 다루며, 「개인정보 보호법」을 준수합니다. 본 방침은 서비스가 어떤 정보를 수집·이용·보관하는지 설명합니다.</p>
+
+    <h2>1. 수집하는 개인정보 항목</h2>
+    <table>
+        <tr><th>구분</th><th>항목</th></tr>
+        <tr><td>계정</td><td>닉네임, 비밀번호(단방향 암호화 저장), 프로필 사진(선택)</td></tr>
+        <tr><td>가계부 데이터</td><td>이용자가 입력한 날짜·가맹점(내용)·금액·카테고리·계좌·수입/지출 구분, 위시리스트 항목</td></tr>
+        <tr><td>이용 기록</td><td>가입 일시, 마지막 접속 일시, 세션 토큰</td></tr>
+    </table>
+    <p class="muted">※ 비밀번호는 bcrypt로 암호화되어 저장되며, 원문은 저장하지 않습니다.</p>
+
+    <h2>2. 개인정보의 이용 목적</h2>
+    <ul>
+        <li>가계부 기록·조회·분석 등 서비스 핵심 기능 제공</li>
+        <li>계정 식별 및 로그인 유지</li>
+        <li>서비스 이용 통계 및 문의 대응</li>
+    </ul>
+
+    <h2>3. 외부 서비스로의 전송</h2>
+    <p>일부 기능은 외부 API를 사용하며, 아래 정보가 전송됩니다. 이용자의 계정·가계부 내역 자체는 전송되지 않습니다.</p>
+    <ul>
+        <li><b>지하철 요금 조회</b>: 입력한 <b>역 이름</b>이 ODsay API로 전송됩니다.</li>
+        <li><b>위시리스트 검색</b>: 입력한 <b>제품명</b>이 네이버 쇼핑 검색 API로 전송됩니다.</li>
+        <li><b>영수증 인식(OCR)</b>: 업로드한 이미지는 서버에서 처리되며 외부로 전송·저장되지 않습니다.</li>
+    </ul>
+
+    <h2>4. 개인정보의 보관 및 파기</h2>
+    <ul>
+        <li>데이터는 MongoDB Atlas(클라우드 데이터베이스)에 저장됩니다.</li>
+        <li>이용자가 <b>계정 탈퇴</b>를 하면 계정·가계부 내역·위시리스트·세션 정보가 <b>즉시 모두 삭제</b>되며 복구할 수 없습니다.</li>
+    </ul>
+
+    <h2>5. 제3자 제공</h2>
+    <p>서비스는 이용자의 개인정보를 제3자에게 판매하거나 제공하지 않습니다. (위 3항의 기능적 API 전송 제외)</p>
+
+    <h2>6. 이용자의 권리</h2>
+    <p>이용자는 언제든지 마이페이지에서 닉네임·비밀번호·프로필 사진을 변경하거나, 계정을 탈퇴하여 모든 데이터를 삭제할 수 있습니다.</p>
+
+    <h2>7. 안전성 확보 조치</h2>
+    <ul>
+        <li>비밀번호 암호화 저장(bcrypt), HTTPS 통신</li>
+        <li>본인 데이터만 접근 가능하도록 소유권 검증</li>
+    </ul>
+
+    <h2>8. 문의</h2>
+    <p>개인정보 관련 문의는 서비스 내 <b>메뉴 → 문의/건의</b>로 남겨주세요.</p>
+
+    <p style="margin-top:30px;"><a href="/">← Zik으로 돌아가기</a></p>
+</body>
+</html>"""
 
 # 서비스워커: 네트워크 우선(오래된 HTML 캐시 방지), 실패 시 캐시로 폴백
 SERVICE_WORKER_JS = """
@@ -1105,6 +1193,9 @@ LOGIN_PAGE = """<!DOCTYPE html>
                 이미 계정이 있으신가요? <a onclick="toggleForm()">로그인</a>
             </div>
         </div>
+        <div style="text-align:center; margin-top:16px;">
+            <a href="/privacy" style="color:#999; font-size:12px; text-decoration:none;">개인정보처리방침</a>
+        </div>
     </div>
 
     <script>
@@ -1639,6 +1730,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             <hr style="margin:16px 0;" />
             <button onclick="logout()" style="background:#666; margin-bottom:8px;">로그아웃</button>
             <button onclick="deleteMyAccount()" style="background:#f44336; margin-bottom:8px;">계정 탈퇴</button>
+            <div style="text-align:center; margin:12px 0;"><a href="/privacy" target="_blank" style="color:#999; font-size:12px;">개인정보처리방침</a></div>
             <button onclick="closeMyPage()" style="background:#ccc; color:#333;">닫기</button>
         </div>
     </div>
