@@ -11,6 +11,7 @@ import re
 import calendar
 import hashlib
 import secrets
+import base64
 import bcrypt
 import ssl
 import certifi
@@ -488,25 +489,25 @@ def parse_free_expense(text: str) -> dict:
 # ── 인증 ────────────────────────────────────────
 @app.post("/auth/check-username")
 async def check_username(username: str = Form(...)):
-    """아이디 중복 확인"""
-    if not username or len(username) < 4:
-        return JSONResponse({"available": False, "message": "아이디는 4자 이상이어야 합니다"})
+    """닉네임 중복 확인"""
+    if not username or len(username) < 2:
+        return JSONResponse({"available": False, "message": "닉네임은 2자 이상이어야 합니다"})
 
     existing = await db.users.find_one({"username": username})
     if existing:
-        return JSONResponse({"available": False, "message": "이미 사용 중인 아이디입니다"})
+        return JSONResponse({"available": False, "message": "이미 사용 중인 닉네임입니다"})
 
-    return JSONResponse({"available": True, "message": "사용 가능한 아이디입니다"})
+    return JSONResponse({"available": True, "message": "사용 가능한 닉네임입니다"})
 
 @app.post("/auth/signup")
 async def signup(username: str = Form(...), password: str = Form(...), password2: str = Form(...)):
-    # 아이디 검증
-    if not username or len(username) < 4:
-        return JSONResponse({"error": "아이디는 4자 이상이어야 합니다"}, status_code=400)
+    # 닉네임 검증
+    if not username or len(username) < 2:
+        return JSONResponse({"error": "닉네임은 2자 이상이어야 합니다"}, status_code=400)
 
     existing = await db.users.find_one({"username": username})
     if existing:
-        return JSONResponse({"error": "이미 사용 중인 아이디입니다"}, status_code=400)
+        return JSONResponse({"error": "이미 사용 중인 닉네임입니다"}, status_code=400)
 
     # 비밀번호 검증
     if password != password2:
@@ -637,9 +638,11 @@ async def update_expense(
     store: str = Form(...),
     amount: int = Form(...),
     category: str = Form(...),
+    kind: str = Form(None),
+    account: str = Form(None),
     session: Optional[str] = Cookie(None),
 ):
-    """지출 수정 (본인 소유만). 날짜는 그대로 두고 가게/금액/카테고리만 변경."""
+    """지출/수입 수정 (본인 소유만). 날짜는 그대로. kind/account는 주어질 때만 변경."""
     user = await get_current_user(session)
     if not user:
         return JSONResponse({"error": "로그인 필요"}, status_code=401)
@@ -652,9 +655,15 @@ async def update_expense(
     except InvalidId:
         return JSONResponse({"error": "잘못된 지출 id입니다"}, status_code=400)
 
+    changes = {"store_name": store, "amount": amount, "category": category}
+    if kind in ("expense", "income"):
+        changes["kind"] = kind
+    if account is not None:
+        changes["account"] = account.strip()
+
     result = await db.expenses.update_one(
         {"_id": oid, "user_id": user["_id"]},
-        {"$set": {"store_name": store, "amount": amount, "category": category}},
+        {"$set": changes},
     )
     if result.matched_count == 0:
         return JSONResponse({"error": "지출 내역을 찾을 수 없습니다"}, status_code=404)
@@ -1045,7 +1054,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
         <div id="login" class="form-section active">
             <form onsubmit="handleLogin(event)">
                 <div class="form-group">
-                    <label>아이디</label>
+                    <label>닉네임</label>
                     <input type="text" name="username" required />
                 </div>
                 <div class="form-group">
@@ -1062,8 +1071,8 @@ LOGIN_PAGE = """<!DOCTYPE html>
         <div id="signup" class="form-section">
             <form onsubmit="handleSignup(event)">
                 <div class="form-group">
-                    <label>아이디</label>
-                    <input type="text" id="signup-username" name="username" placeholder="4자 이상" required onblur="checkUsername()" />
+                    <label>닉네임</label>
+                    <input type="text" id="signup-username" name="username" placeholder="2자 이상" required onblur="checkUsername()" />
                     <small id="username-feedback" style="font-size: 12px; color: #999;"></small>
                 </div>
                 <div class="form-group">
@@ -1096,7 +1105,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
         document.getElementById('signup').classList.toggle('active');
     }
 
-    // 아이디 중복 확인
+    // 닉네임 중복 확인
     async function checkUsername() {
         const username = document.getElementById('signup-username').value;
         const feedback = document.getElementById('username-feedback');
@@ -1234,7 +1243,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         .main { background: white; border-radius: 12px; padding: 30px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
         .sidebar { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); height: fit-content; }
 
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 2px solid #eee; padding-bottom: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 2px solid #eee; padding-bottom: 20px; position: relative; }
         .header h1 { font-size: 32px; }
         .header button { padding: 8px 16px; width: auto; }
 
@@ -1365,15 +1374,19 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
     <div class="container">
         <div class="main">
             <div class="header">
-                <h1><img src="/static/logo-cat.png" class="logo-img" alt="" onerror="this.remove()" /> Zik</h1>
-                <button onclick="logout()" class="desktop-only">로그아웃</button>
-                <button class="mobile-only mobile-menu-btn" onclick="toggleMobileMenu()">☰</button>
+                <div style="display:flex; align-items:center; gap:8px; z-index:1;">
+                    <img id="header-pic" src="/static/logo-cat.png" alt="" onerror="this.style.visibility='hidden'" style="width:38px; height:38px; border-radius:50%; object-fit:cover;" />
+                    <span id="header-nick" style="font-weight:600; font-size:15px;"></span>
+                </div>
+                <div style="position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); font-size:26px; font-weight:800; color:#333; pointer-events:none;">Zik</div>
+                <button onclick="openMyPage()" class="desktop-only" style="width:auto; z-index:1;">마이페이지</button>
+                <button class="mobile-only mobile-menu-btn" onclick="toggleMobileMenu()" style="z-index:1;">☰</button>
             </div>
             <div id="mobile-menu" class="mobile-menu">
                 <button onclick="mobileNav('calendar')">📅 달력</button>
                 <button onclick="mobileNav('analysis')">📊 분석</button>
                 <button onclick="mobileNav('wishlist')">🛍️ 위시리스트</button>
-                <button onclick="logout()">🚪 로그아웃</button>
+                <button onclick="openMyPage(); toggleMobileMenu();">👤 마이페이지</button>
             </div>
 
             <div class="tabs">
@@ -1581,6 +1594,34 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
             <div style="font-size: 13px; font-weight: 600; margin-bottom: 6px;">내 계좌/카드</div>
             <div id="onboardList" style="max-height: 180px; overflow-y: auto; margin-bottom: 18px;"></div>
             <button onclick="onboardComplete()" style="padding: 13px; font-size: 15px;">시작하기</button>
+        </div>
+    </div>
+
+    <!-- 마이페이지 -->
+    <div id="myPageModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.55); z-index: 1100; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 14px; padding: 26px; width: 92%; max-width: 420px; max-height: 90vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.25);">
+            <h2 style="margin-bottom: 18px;">👤 마이페이지</h2>
+            <div style="text-align: center; margin-bottom: 18px;">
+                <img id="mypage-pic" src="/static/logo-cat.png" alt="" onerror="this.style.visibility='hidden'" style="width:90px; height:90px; border-radius:50%; object-fit:cover; border:2px solid #eee;" />
+                <input type="file" id="mypage-pic-file" accept="image/*" style="display:none;" onchange="changeProfilePic(this)" />
+                <div style="display:flex; gap:6px; justify-content:center; margin-top:8px;">
+                    <button onclick="document.getElementById('mypage-pic-file').click()" style="width:auto; padding:6px 12px; font-size:13px;">사진 변경</button>
+                    <button onclick="resetProfilePic()" style="width:auto; padding:6px 12px; font-size:13px; background:#999;">기본으로</button>
+                </div>
+            </div>
+            <label style="display:block; font-size:13px; color:#666; margin-bottom:4px;">닉네임</label>
+            <div style="display:flex; gap:5px; margin-bottom:16px;">
+                <input type="text" id="mypage-nick" style="flex:1;" />
+                <button onclick="saveNickname()" style="width:60px;">변경</button>
+            </div>
+            <label style="display:block; font-size:13px; color:#666; margin-bottom:4px;">비밀번호 변경</label>
+            <input type="password" id="mypage-cur-pw" placeholder="현재 비밀번호" style="margin-bottom:6px;" />
+            <input type="password" id="mypage-new-pw" placeholder="새 비밀번호 (8자+영문+숫자+특수문자)" style="margin-bottom:6px;" />
+            <button onclick="savePassword()" style="margin-bottom:16px;">비밀번호 변경</button>
+            <hr style="margin:16px 0;" />
+            <button onclick="logout()" style="background:#666; margin-bottom:8px;">로그아웃</button>
+            <button onclick="deleteMyAccount()" style="background:#f44336; margin-bottom:8px;">계정 탈퇴</button>
+            <button onclick="closeMyPage()" style="background:#ccc; color:#333;">닫기</button>
         </div>
     </div>
 
@@ -1984,6 +2025,10 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                                 '<select id="edit-cat" style="margin:0; padding:6px; font-size:13px; flex:1;">' + catOptions(e.category) + '</select>' +
                             '</div>' +
                             '<div style="display:flex; gap:5px;">' +
+                                '<select id="edit-kind" style="margin:0; padding:6px; font-size:13px; flex:1;"><option value="expense"' + (e.kind === 'income' ? '' : ' selected') + '>지출</option><option value="income"' + (e.kind === 'income' ? ' selected' : '') + '>수입</option></select>' +
+                                '<select id="edit-acc" style="margin:0; padding:6px; font-size:13px; flex:1;">' + accOptions(e.account) + '</select>' +
+                            '</div>' +
+                            '<div style="display:flex; gap:5px;">' +
                                 '<button onclick="saveEditExpense(' + i + ')" style="flex:1; margin:0; padding:6px; font-size:12px;">저장</button>' +
                                 '<button onclick="cancelEditExpense()" style="flex:1; margin:0; padding:6px; font-size:12px; background:#999;">취소</button>' +
                             '</div>' +
@@ -2030,6 +2075,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         const store = document.getElementById('edit-store').value.trim();
         const amount = document.getElementById('edit-amount').value;
         const category = document.getElementById('edit-cat').value;
+        const kind = document.getElementById('edit-kind').value;
+        const account = document.getElementById('edit-acc').value;
         if (!store || !amount) { showToast('가게명과 금액을 입력해주세요', 'error'); return; }
 
         const form = new FormData();
@@ -2037,6 +2084,8 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         form.append('store', store);
         form.append('amount', parseInt(amount));
         form.append('category', category);
+        form.append('kind', kind);
+        form.append('account', account);
         try {
             const res = await fetch('/api/expenses/update', {method: 'POST', body: form});
             const result = await res.json();
@@ -2859,13 +2908,96 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
     // ── 첫 접속 온보딩 (은행 등록) ──
     const COMMON_BANKS = ["카카오뱅크", "토스뱅크", "국민은행", "신한은행", "우리은행", "하나은행", "농협", "케이뱅크", "현금", "신용카드"];
+    let myNickname = '';
     async function checkOnboarding() {
         try {
             const res = await fetch('/api/me');
             const data = await res.json();
             if (data.accounts) userAccounts = data.accounts;
+            applyProfile(data);
             if (!data.onboarded) openOnboarding();
         } catch (e) {}
+    }
+    function applyProfile(data) {
+        myNickname = data.nickname || '';
+        const nick = document.getElementById('header-nick');
+        if (nick) nick.textContent = myNickname ? (myNickname + '님') : '';
+        const pic = document.getElementById('header-pic');
+        if (pic) {
+            pic.src = data.profile_pic || '/static/logo-cat.png';
+            pic.style.visibility = 'visible';
+        }
+        const mp = document.getElementById('mypage-pic');
+        if (mp) mp.src = data.profile_pic || '/static/logo-cat.png';
+    }
+
+    // ── 마이페이지 ──
+    function openMyPage() {
+        document.getElementById('mypage-nick').value = myNickname;
+        document.getElementById('mypage-cur-pw').value = '';
+        document.getElementById('mypage-new-pw').value = '';
+        document.getElementById('myPageModal').style.display = 'flex';
+    }
+    function closeMyPage() { document.getElementById('myPageModal').style.display = 'none'; }
+    async function saveNickname() {
+        const v = document.getElementById('mypage-nick').value.trim();
+        if (v.length < 2) { showToast('닉네임은 2자 이상이어야 해요', 'error'); return; }
+        const form = new FormData(); form.append('nickname', v);
+        const res = await fetch('/api/profile/nickname', {method: 'POST', body: form});
+        const data = await res.json();
+        if (data.status === 'success') {
+            myNickname = data.nickname;
+            const nick = document.getElementById('header-nick');
+            if (nick) nick.textContent = myNickname + '님';
+            showToast('닉네임이 변경됐어요', 'success');
+        } else showToast(data.error || '변경 실패', 'error');
+    }
+    async function savePassword() {
+        const cur = document.getElementById('mypage-cur-pw').value;
+        const nw = document.getElementById('mypage-new-pw').value;
+        if (!cur || !nw) { showToast('현재/새 비밀번호를 입력해주세요', 'error'); return; }
+        const form = new FormData(); form.append('current', cur); form.append('new_password', nw);
+        const res = await fetch('/api/profile/password', {method: 'POST', body: form});
+        const data = await res.json();
+        if (data.status === 'success') {
+            document.getElementById('mypage-cur-pw').value = '';
+            document.getElementById('mypage-new-pw').value = '';
+            showToast('비밀번호가 변경됐어요', 'success');
+        } else showToast(data.error || '변경 실패', 'error');
+    }
+    async function changeProfilePic(inputEl) {
+        const file = inputEl.files && inputEl.files[0];
+        if (!file) return;
+        const form = new FormData(); form.append('file', file);
+        showToast('사진 업로드 중...', '');
+        try {
+            const res = await fetch('/api/profile/pic', {method: 'POST', body: form});
+            const data = await res.json();
+            if (data.status === 'success') {
+                document.getElementById('mypage-pic').src = data.profile_pic;
+                const pic = document.getElementById('header-pic');
+                if (pic) { pic.src = data.profile_pic; pic.style.visibility = 'visible'; }
+                showToast('프로필 사진이 변경됐어요', 'success');
+            } else showToast(data.error || '변경 실패', 'error');
+        } catch (e) { showToast('업로드 실패', 'error'); }
+        inputEl.value = '';
+    }
+    async function resetProfilePic() {
+        const res = await fetch('/api/profile/pic/reset', {method: 'POST'});
+        const data = await res.json();
+        if (data.status === 'success') {
+            document.getElementById('mypage-pic').src = '/static/logo-cat.png';
+            const pic = document.getElementById('header-pic');
+            if (pic) { pic.src = '/static/logo-cat.png'; pic.style.visibility = 'visible'; }
+            showToast('기본 사진으로 바꿨어요', 'success');
+        }
+    }
+    async function deleteMyAccount() {
+        if (!confirm('정말 탈퇴하시겠어요? 모든 내역·위시리스트가 삭제되며 되돌릴 수 없어요.')) return;
+        const res = await fetch('/api/profile/delete', {method: 'POST'});
+        const data = await res.json();
+        if (data.status === 'success') { location.href = '/'; }
+        else showToast(data.error || '탈퇴 실패', 'error');
     }
     function openOnboarding() {
         const box = document.getElementById('bankChips');
@@ -3013,7 +3145,13 @@ async def get_me(session: Optional[str] = Cookie(None)):
     accounts = user.get("accounts", DEFAULT_ACCOUNTS)
     # 온보딩 완료 플래그가 없고 계좌도 기본 상태면 온보딩 필요
     onboarded = bool(user.get("onboarded")) or len(accounts) > 1
-    return {"username": user.get("username"), "onboarded": onboarded, "accounts": accounts}
+    return {
+        "username": user.get("username"),
+        "nickname": user.get("username"),  # 로그인 닉네임 = 닉네임
+        "profile_pic": user.get("profile_pic", ""),
+        "onboarded": onboarded,
+        "accounts": accounts,
+    }
 
 @app.post("/api/onboard/complete")
 async def complete_onboard(session: Optional[str] = Cookie(None)):
@@ -3022,6 +3160,72 @@ async def complete_onboard(session: Optional[str] = Cookie(None)):
         return JSONResponse({"error": "로그인 필요"}, status_code=401)
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"onboarded": True}})
     return {"status": "success"}
+
+# ── 마이페이지 / 프로필 ─────────────────────────────
+@app.post("/api/profile/nickname")
+async def update_nickname(nickname: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    nickname = nickname.strip()
+    if len(nickname) < 2:
+        return JSONResponse({"error": "닉네임은 2자 이상이어야 합니다"}, status_code=400)
+    if nickname != user["username"]:
+        if await db.users.find_one({"username": nickname}):
+            return JSONResponse({"error": "이미 사용 중인 닉네임입니다"}, status_code=400)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"username": nickname}})
+    return {"status": "success", "nickname": nickname}
+
+@app.post("/api/profile/password")
+async def update_password(current: str = Form(...), new_password: str = Form(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    if not verify_password(current, user.get("password", "")):
+        return JSONResponse({"error": "현재 비밀번호가 일치하지 않습니다"}, status_code=400)
+    ok, msg = validate_password(new_password)
+    if not ok:
+        return JSONResponse({"error": msg}, status_code=400)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"password": hash_password(new_password)}})
+    return {"status": "success"}
+
+@app.post("/api/profile/pic")
+async def update_profile_pic(file: UploadFile = File(...), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    try:
+        img = Image.open(BytesIO(await file.read())).convert("RGB")
+        img.thumbnail((160, 160), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        data_url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return JSONResponse({"error": "이미지를 처리할 수 없습니다"}, status_code=400)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"profile_pic": data_url}})
+    return {"status": "success", "profile_pic": data_url}
+
+@app.post("/api/profile/pic/reset")
+async def reset_profile_pic(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"profile_pic": ""}})
+    return {"status": "success"}
+
+@app.post("/api/profile/delete")
+async def delete_account_user(session: Optional[str] = Cookie(None)):
+    """계정 탈퇴: 내역·위시리스트·세션·사용자 모두 삭제."""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    await db.expenses.delete_many({"user_id": user["_id"]})
+    await db.wishlist.delete_many({"user_id": user["_id"]})
+    await db.sessions.delete_many({"user_id": user["_id"]})
+    await db.users.delete_one({"_id": user["_id"]})
+    response = JSONResponse({"status": "success"})
+    response.delete_cookie("session")
+    return response
 
 # ── 계좌(은행/카드) 관리 API ────────────────────────
 @app.get("/api/accounts")
