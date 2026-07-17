@@ -620,6 +620,8 @@ async def signup(username: str = Form(...), password: str = Form(...), password2
         "categories": DEFAULT_CATEGORIES,
         "accounts": DEFAULT_ACCOUNTS,
         "onboarded": False,  # 첫 접속 시 은행 등록 온보딩
+        "budget": 0,               # 월 예산(0=미설정)
+        "category_budgets": {},    # 카테고리별 예산
         "created_at": datetime.now().isoformat()
     }
     result = await db.users.insert_one(user)
@@ -871,8 +873,59 @@ async def get_analysis(period: str = "month", offset: int = 0, account: str = ""
         "net": income_total - expense_total,
         "by_category": by_category,
         "by_account": by_account,
+        "budget": user.get("budget", 0),
+        "category_budgets": user.get("category_budgets", {}),
         "expenses": expenses
     }
+
+@app.get("/api/analysis/trend")
+async def analysis_trend(months: int = 6, account: str = "", session: Optional[str] = Cookie(None)):
+    """최근 N개월 수입/지출 추이 (차트용)."""
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    months = max(1, min(24, months))
+    account = (account or "").strip()
+    today = datetime.now()
+    result = []
+    for k in range(months - 1, -1, -1):
+        mi = today.year * 12 + (today.month - 1) - k
+        yr, mo = divmod(mi, 12); mo += 1
+        last_day = calendar.monthrange(yr, mo)[1]
+        start = f"{yr}-{mo:02d}-01"
+        end = f"{yr}-{mo:02d}-{last_day:02d}"
+        q = {"user_id": user["_id"], "date": {"$gte": start, "$lte": end}}
+        inc = exp = 0
+        async for doc in db.expenses.find(q):
+            if account and (doc.get("account", "") or "(미지정)") != account:
+                continue
+            if doc.get("kind") == "income":
+                inc += doc.get("amount", 0)
+            else:
+                exp += doc.get("amount", 0)
+        result.append({"label": f"{mo}월", "income": inc, "expense": exp})
+    return {"trend": result}
+
+# ── 예산 ────────────────────────────────────────────
+@app.get("/api/budget")
+async def get_budget(session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    return {"budget": user.get("budget", 0), "category_budgets": user.get("category_budgets", {})}
+
+@app.post("/api/budget")
+async def set_budget(budget: int = Form(0), category_budgets: str = Form("{}"), session: Optional[str] = Cookie(None)):
+    user = await get_current_user(session)
+    if not user:
+        return JSONResponse({"error": "로그인 필요"}, status_code=401)
+    try:
+        cb = _json.loads(category_budgets) if category_budgets else {}
+        cb = {str(k): int(v) for k, v in cb.items() if int(v) > 0}
+    except Exception:
+        cb = {}
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"budget": max(0, budget), "category_budgets": cb}})
+    return {"status": "success", "budget": max(0, budget), "category_budgets": cb}
 
 # ── 카테고리 자동분류 (무료 로컬: 과거 내역 학습 → 키워드 → 기본값) ──
 # 처음 보는 가게 대비 최소 키워드 힌트. 사용자 카테고리에 존재할 때만 매핑됨.
@@ -1335,6 +1388,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         window.addEventListener('load', function() { navigator.serviceWorker.register('/sw.js').catch(function(){}); });
     }
     </script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; }
@@ -1552,6 +1606,26 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
 
                 <div class="stats" id="account-summary" style="margin-bottom:16px;"></div>
 
+                <!-- 예산 -->
+                <div class="stats" id="budget-box" style="margin-bottom:16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <h4 style="margin:0;">💰 이번 달 예산</h4>
+                        <button onclick="openBudget()" style="width:auto; margin:0; padding:5px 12px; font-size:12px;">설정</button>
+                    </div>
+                    <div id="budget-content" style="margin-top:10px;"></div>
+                </div>
+
+                <!-- 차트 -->
+                <div class="stats" style="margin-bottom:16px;">
+                    <h4 style="margin-bottom:10px;">📊 카테고리별 지출</h4>
+                    <div style="max-width:260px; margin:0 auto;"><canvas id="chart-category"></canvas></div>
+                    <div id="chart-category-empty" style="text-align:center; color:#999; font-size:13px; display:none;">지출 내역이 없어요</div>
+                </div>
+                <div class="stats" style="margin-bottom:16px;">
+                    <h4 style="margin-bottom:10px;">📈 월별 추이</h4>
+                    <canvas id="chart-trend" style="max-height:220px;"></canvas>
+                </div>
+
                 <div class="stats" id="analysis-stats">
                     <h4>카테고리별 지출</h4>
                     <div class="stat-item">
@@ -1684,6 +1758,19 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 <button onclick="addNewAccount()" style="width: 60px;">추가</button>
             </div>
             <button onclick="closeAccountModal()" style="margin-top: 20px; background: #999;">닫기</button>
+        </div>
+    </div>
+
+    <!-- 예산 설정 -->
+    <div id="budgetModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.55); z-index: 1100; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 14px; padding: 26px; width: 92%; max-width: 420px; max-height: 90vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.25);">
+            <h2 style="margin-bottom: 16px;">💰 예산 설정</h2>
+            <label style="display:block; font-size:13px; color:#666; margin-bottom:4px;">이번 달 전체 예산 (원)</label>
+            <input type="number" id="budget-total" placeholder="예: 500000" style="margin-bottom:16px;" />
+            <div style="font-size:13px; color:#666; margin-bottom:6px;">카테고리별 예산 (선택)</div>
+            <div id="budget-cats" style="max-height:220px; overflow-y:auto; margin-bottom:16px;"></div>
+            <button onclick="saveBudget()">저장</button>
+            <button onclick="closeBudget()" style="margin-top:8px; background:#ccc; color:#333;">닫기</button>
         </div>
     </div>
 
@@ -2287,6 +2374,108 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
         loadAnalysis();
     }
 
+    // ── 차트 & 예산 ──
+    let catChart = null, trendChart = null;
+    const CHART_COLORS = ['#4A90D9','#e74c3c','#2ecc71','#f39c12','#9b59b6','#1abc9c','#e67e22','#34495e','#fd79a8','#00b894'];
+
+    function renderCategoryChart(byCategory) {
+        const cv = document.getElementById('chart-category');
+        const empty = document.getElementById('chart-category-empty');
+        if (!cv || typeof Chart === 'undefined') return;
+        if (catChart) { catChart.destroy(); catChart = null; }
+        if (!byCategory || byCategory.length === 0) {
+            cv.style.display = 'none'; if (empty) empty.style.display = 'block'; return;
+        }
+        cv.style.display = 'block'; if (empty) empty.style.display = 'none';
+        catChart = new Chart(cv, {
+            type: 'doughnut',
+            data: { labels: byCategory.map(c => c.category), datasets: [{ data: byCategory.map(c => c.amount), backgroundColor: CHART_COLORS, borderWidth: 1 }] },
+            options: { plugins: { legend: { position: 'bottom', labels: { font: { size: 11 } } } } }
+        });
+    }
+
+    async function loadTrendChart() {
+        const cv = document.getElementById('chart-trend');
+        if (!cv || typeof Chart === 'undefined') return;
+        const af = document.getElementById('account-filter');
+        const acct = af ? af.value : '';
+        try {
+            const res = await fetch('/api/analysis/trend?months=6&account=' + encodeURIComponent(acct));
+            const t = (await res.json()).trend || [];
+            if (trendChart) { trendChart.destroy(); trendChart = null; }
+            trendChart = new Chart(cv, {
+                type: 'bar',
+                data: { labels: t.map(x => x.label), datasets: [
+                    { label: '수입', data: t.map(x => x.income), backgroundColor: '#2ecc71' },
+                    { label: '지출', data: t.map(x => x.expense), backgroundColor: '#4A90D9' }
+                ] },
+                options: { plugins: { legend: { position: 'bottom' } }, scales: { y: { beginAtZero: true } } }
+            });
+        } catch (e) {}
+    }
+
+    function renderBudget(data) {
+        const box = document.getElementById('budget-content');
+        if (!box) return;
+        const budget = data.budget || 0;
+        const spent = data.expense_total || 0;
+        const isThisMonth = (currentPeriod === 'month' && periodOffset === 0);
+        if (!budget) {
+            box.innerHTML = '<div style="color:#999; font-size:13px;">설정하면 남은 금액·초과 경고를 볼 수 있어요.</div>';
+            return;
+        }
+        const pct = Math.min(100, Math.round(spent / budget * 100));
+        const over = spent > budget;
+        const remain = budget - spent;
+        const barColor = over ? '#f44336' : (pct >= 80 ? '#f39c12' : '#4A90D9');
+        box.innerHTML =
+            '<div style="display:flex; justify-content:space-between; font-size:13px; margin-bottom:6px;">' +
+                '<span>' + spent.toLocaleString() + ' / ' + budget.toLocaleString() + '원</span>' +
+                '<b style="color:' + (over ? '#f44336' : '#2e7d32') + ';">' + (over ? '초과 ' + Math.abs(remain).toLocaleString() : '남은 ' + remain.toLocaleString()) + '원</b>' +
+            '</div>' +
+            '<div style="background:#eee; border-radius:8px; height:12px; overflow:hidden;"><div style="width:' + pct + '%; height:100%; background:' + barColor + '; transition:width .3s;"></div></div>' +
+            (over ? '<div style="color:#f44336; font-size:12px; margin-top:6px;">⚠️ 예산을 초과했어요!</div>' : '') +
+            (isThisMonth ? '' : '<div style="color:#aaa; font-size:11px; margin-top:4px;">※ 예산은 이번 달 기준</div>');
+    }
+
+    async function openBudget() {
+        try {
+            const data = await (await fetch('/api/budget')).json();
+            document.getElementById('budget-total').value = data.budget || '';
+            const cb = data.category_budgets || {};
+            document.getElementById('budget-cats').innerHTML = (userCategories || []).map(c =>
+                '<div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;"><span style="flex:1; font-size:13px;">' + escapeHtml(c) + '</span>' +
+                '<input type="number" data-cat="' + escapeHtml(c) + '" value="' + (cb[c] || '') + '" placeholder="0" style="width:120px; margin:0; padding:6px; font-size:13px;" /></div>'
+            ).join('');
+        } catch (e) {}
+        document.getElementById('budgetModal').style.display = 'flex';
+        lockScroll();
+    }
+    function closeBudget() { document.getElementById('budgetModal').style.display = 'none'; unlockScroll(); }
+    // 지출 저장 후 이번 달 예산 초과 확인 → 토스트
+    async function checkBudgetWarn() {
+        try {
+            const d = await (await fetch('/api/analysis?period=month&offset=0')).json();
+            if (d.budget && d.expense_total > d.budget) {
+                showToast('⚠️ 이번 달 예산 초과! (' + d.expense_total.toLocaleString() + '/' + d.budget.toLocaleString() + '원)', 'error');
+            }
+        } catch (e) {}
+    }
+    async function saveBudget() {
+        const total = parseInt(document.getElementById('budget-total').value) || 0;
+        const cb = {};
+        document.querySelectorAll('#budget-cats input[data-cat]').forEach(inp => {
+            const v = parseInt(inp.value) || 0;
+            if (v > 0) cb[inp.getAttribute('data-cat')] = v;
+        });
+        const form = new FormData();
+        form.append('budget', total);
+        form.append('category_budgets', JSON.stringify(cb));
+        const data = await (await fetch('/api/budget', {method: 'POST', body: form})).json();
+        if (data.status === 'success') { closeBudget(); showToast('예산이 저장됐어요', 'success'); loadAnalysis(); }
+        else showToast('저장 실패', 'error');
+    }
+
     async function loadAnalysis() {
         const statsDiv = document.getElementById('analysis-stats');
         const tableBody = document.getElementById('expense-table');
@@ -2334,6 +2523,12 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                     accDiv.innerHTML = ah;
                 }
             }
+
+            // 예산 진행바 (달 기준일 때 의미 있음)
+            renderBudget(data);
+            // 차트
+            renderCategoryChart(byCategory);
+            loadTrendChart();
 
             // 수입/지출/순수지 요약 + 카테고리별 지출
             const incomeTotal = data.income_total || 0;
@@ -2423,6 +2618,7 @@ DASHBOARD_PAGE = """<!DOCTYPE html>
                 });
 
                 showToast('저장 완료!', 'success');
+                if (inputKind === 'expense') checkBudgetWarn();
             } else {
                 showToast(result.error || '저장 실패', 'error');
             }
